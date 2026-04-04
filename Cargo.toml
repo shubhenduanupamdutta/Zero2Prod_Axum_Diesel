@@ -1,0 +1,7 @@
+[package]
+name = "Zero2Prod_Axum_Diesel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+
+[dependencies]
