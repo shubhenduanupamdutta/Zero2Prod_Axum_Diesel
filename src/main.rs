@@ -1,17 +1,14 @@
-use axum::{Router, extract::Path, response::IntoResponse, routing::get};
+use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
 use tokio::net::TcpListener;
 
-async fn greet(name: Option<Path<String>>) -> impl IntoResponse {
-    let name = name.map(|Path(n)| n).unwrap_or("World".into());
-    format!("Hello, {}!", name)
+
+async fn health_check() -> impl IntoResponse {
+    StatusCode::OK
 }
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
-    let app = Router::new()
-        .route("/", get(greet))
-        .route("/{name}", get(greet));
-
+    let app = Router::new().route("/health_check", get(health_check));
     let listener = TcpListener::bind("127.0.0.1:8000").await?;
     axum::serve(listener, app).await
 }
