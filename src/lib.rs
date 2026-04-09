@@ -1,4 +1,4 @@
-use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{Router, http::StatusCode, response::IntoResponse, routing::get, serve::Serve};
 use tokio::net::TcpListener;
 
 
@@ -6,9 +6,8 @@ async fn health_check() -> impl IntoResponse {
     StatusCode::OK
 }
 
-
-pub async fn run() -> Result<(), std::io::Error> {
+pub fn run(listener: TcpListener) -> Result<Serve<TcpListener, Router, Router>, std::io::Error> {
     let app = Router::new().route("/health_check", get(health_check));
-    let listener = TcpListener::bind("127.0.0.1:8000").await?;
-    axum::serve(listener, app).await
+    let server = axum::serve(listener, app);
+    Ok(server)
 }
