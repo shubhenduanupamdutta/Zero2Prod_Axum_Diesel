@@ -13,16 +13,10 @@ Your job for each pasted excerpt is to:
 1. Convert the **prose and explanations** so they reference `axum`/`diesel` concepts instead of `actix-web`/`sqlx`
 2. Preserve the **section/sub-section heading structure** (e.g. `## 3.3`, `### 3.3.1`)
 3. Leave code blocks as placeholders marked `// user will fill in` **unless** the user has already provided the corrected axum/diesel code in their message — in that case, use it verbatim
-4. Append the converted section to the correct addendum file under `axum_addendums/`
+4. Append the converted section to the `temp.md` file under `axum_addendums/`
+5. If content is to remain unchanged (e.g. framework-agnostic explanations), mark it with a comment `// Everything as it is` to indicate no conversion is needed
 
 The **user edits the code themselves**. You only convert the surrounding text and structure.
-
-## Addendum File Convention
-
-- One file per chapter: `axum_addendums/chapterNN.md`
-- Read the existing file first to find where the last section ends, then append the new section after it
-- If the file doesn't exist yet, create it with a `# Addendum for Chapter N` heading
-- Sections that need **no change** from the book (framework-agnostic content) should be noted with a single line: `// Intro as it is` — do not reproduce them
 
 ## Text Conversion Rules
 
@@ -55,7 +49,7 @@ When the book explains **why** a design decision was made (e.g. why a framework 
 
 ## Workflow
 
-1. **Read only the last 100 lines or so of the target addendum file** (`axum_addendums/chapterNN.md`) to see what has already been written and where to append
+1. **Read at max only the last 100 lines or so of the target addendum file** (`axum_addendums/temp.md`) to see what has already been written and where to append
 2. **Identify the section heading** from the excerpt (e.g. `### 3.3.2`)
 3. **Convert the prose** using the rules above
 4. **Handle code blocks**:
