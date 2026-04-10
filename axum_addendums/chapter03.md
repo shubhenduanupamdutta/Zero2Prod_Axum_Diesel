@@ -769,3 +769,476 @@ async fn health_check_works() {
 ```
 
 All is good — `cargo test` comes out green. Our setup is much more robust now!
+
+---
+
+## 3.6 Refocus
+
+---
+
+Let's take a small break to look back — we covered a fair amount of ground!
+
+We set out to implement a `/health_check` endpoint and that gave us the opportunity to learn more about the fundamentals of our web framework, axum, as well as the basics of (integration) testing for Rust APIs.
+
+It is now time to capitalise on what we learned to finally fulfill the first user story of our email newsletter project:
+
+> As a blog visitor,
+> I want to subscribe to the newsletter,
+> So that I can receive email updates when new content is published on the blog.
+
+We expect our blog visitors to input their email address in a form embedded on a web page. The form will trigger a `POST /subscriptions` call to our backend API that will actually process the information, store it and send back a response.
+
+We will have to dig into:
+
+- how to read data collected in a HTML form in axum (i.e. how do I parse the request body of a POST?);
+- what libraries are available to work with a PostgreSQL database in Rust (diesel vs sqlx vs tokio-postgres);
+- how to setup and manage migrations for our database;
+- how to get our hands on a database connection in our API request handlers;
+- how to test for side-effects (a.k.a. stored data) in our integration tests;
+- how to avoid weird interactions between tests when working with a database.
+
+Let's get started!
+
+---
+
+## 3.7 Working with HTML Forms
+
+---
+
+### 3.7.1 Refining Our Requirements
+
+// Everything as it is
+
+### 3.7.2 Capturing Our Requirements As Tests
+
+Now that we understand better what needs to happen, let's encode our expectation in a couple of integration tests.
+
+Let's add the new tests to the existing `tests/health_check.rs` file - we will re-organize our test suite folder structure afterwards.
+
+```rust
+//! tests/health_check.rs
+use tokio::net::TcpListener;
+
+/// Spawns the application and returns the address (including port) that it is listening on.
+///
+/// The application is spawned on a random available port to avoid conflicts with other tests or
+/// applications.
+///
+/// # Returns
+///
+/// A `String` containing the full address (including port) that the application is listening on,
+/// e.g., "http://127.0.0.1:XXXX"
+async fn spawn_app() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind to address");
+    let port = listener.local_addr().unwrap().port();
+    let server = zero2prod::run(listener).expect("Failed to start server");
+    let _server_handle = tokio::spawn(server.into_future());
+
+    format!("http://127.0.0.1:{}", port)
+}
+
+#[tokio::test]
+async fn health_check_works() {
+    [...]
+}
+
+#[tokio::test]
+async fn subscribe_returns_a_200_for_valid_form_data() {
+    // Arrange
+    let app_address = spawn_app().await;
+    let client = reqwest::Client::new();
+    // Act
+    let body = "name=le%20guin&email=ursula_le_guin%40gmail.com";
+    let response = client
+        .post(format!("{}/subscriptions", &app_address))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .expect("Failed to execute request.");
+    // Assert
+    assert_eq!(200, response.status().as_u16());
+}
+
+#[tokio::test]
+async fn subscribe_returns_a_422_when_data_is_missing() {
+    // Arrange
+    let app_address = spawn_app().await;
+    let client = reqwest::Client::new();
+    let test_cases = vec![
+        ("name=le%20guin", "missing the email"),
+        ("email=ursula_le_guin%40gmail.com", "missing the name"),
+        ("", "missing both name and email"),
+    ];
+    for (invalid_body, error_message) in test_cases {
+        // Act
+        let response = client
+            .post(format!("{}/subscriptions", &app_address))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(invalid_body)
+            .send()
+            .await
+            .expect("Failed to execute request.");
+        // Assert
+        assert_eq!(
+            422,
+            response.status().as_u16(),
+            // Additional customized error message on test failure
+            "The API did not fail with 422 Unprocessable Entity when the payload was {}.",
+            error_message
+        );
+    }
+}
+```
+
+`subscribe_returns_a_422_when_data_is_missing` is an example of a table-driven test, also known as a parametrised test.
+
+It is particularly helpful when dealing with bad inputs — instead of duplicating test logic several times we can simply run the same assertion against a collection of known invalid bodies that we expect to fail in the same way.
+
+With parametrised tests it is important to have good error messages on failures: `assertion failed on line XYZ` is not great if you cannot tell which specific input is broken! On the flip side, that parametrised test is covering a lot of ground so it makes sense to invest a bit more time in generating a nice failure message.
+
+Test frameworks in other languages sometimes have native support for this testing style (e.g. parametrised tests in `pytest` or `InlineData` in xUnit for C#); in the Rust ecosystem, you can get similar functionality via a third-party crate, `rstest`.
+
+Let's run our test suite now:
+
+```sh
+---- health_check::subscribe_returns_a_200_for_valid_form_data stdout ----
+thread 'health_check::subscribe_returns_a_200_for_valid_form_data'
+panicked at 'assertion failed: `(left == right)`
+left: `200`,
+right: `404`:
+---- health_check::subscribe_returns_a_422_when_data_is_missing stdout ----
+thread 'health_check::subscribe_returns_a_422_when_data_is_missing'
+panicked at 'assertion failed: `(left == right)`
+left: `422`,
+right: `404`:
+The API did not fail with 422 Unprocessable Entity when the payload was missing the email.'
+```
+
+As expected, all our new tests are failing.
+
+You can immediately spot a limitation of "roll-your-own" parametrised tests: as soon as one test case fails, the execution stops and we do not know the outcome for the following test cases.
+
+Let's get started on the implementation.
+
+### 3.7.3 Parsing Form Data From A `POST` Request
+
+All tests are failing because the application returns a `404 NOT FOUND` for `POST` requests hitting `/subscriptions`. Legitimate behaviour: we do not have a handler registered for that path.
+
+Let's fix it by adding a matching route to our `Router` in `src/lib.rs`:
+
+```rust
+//! src/lib.rs
+use axum::{
+    Router,
+    http::StatusCode,
+    routing::{get, post},
+    serve::Serve,
+};
+use tokio::net::TcpListener;
+
+// We were returning `impl IntoResponse` before.
+// We are not spelling out the type explicitly given that we have become more familiar with `axum`.
+// There is no performance difference! Just a stylistic choice :)
+async fn health_check() -> StatusCode {
+    StatusCode::OK
+}
+
+// Let's start simple: we always return a 200 OK
+async fn subscribe() -> StatusCode {
+    StatusCode::OK
+}
+
+pub fn run(listener: TcpListener) -> Result<Serve<TcpListener, Router, Router>, std::io::Error> {
+    let app = Router::new()
+        .route("/health_check", get(health_check))
+        // A new entry in our router table for POST /subscriptions requests
+        .route("/subscriptions", post(subscribe));
+    let server = axum::serve(listener, app);
+    Ok(server)
+}
+
+```
+
+Running our test suite again:
+
+```sh
+running 3 tests
+test health_check_works ... ok
+test subscribe_returns_a_200_for_valid_form_data ... ok
+test subscribe_returns_a_422_when_data_is_missing ... FAILED
+
+failures:
+
+---- subscribe_returns_a_422_when_data_is_missing stdout ----
+
+thread 'subscribe_returns_a_422_when_data_is_missing' (23270) panicked at tests/health_check.rs:82:9:
+assertion `left == right` failed: The API did not fail with 422 Unprocessable Entity when the payload was missing the email.
+  left: 422,
+ right: 200
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    subscribe_returns_a_400_when_data_is_missing
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+```
+
+`subscribe_returns_a_200_for_valid_form_data` now passes: well, our handler accepts **all** incoming data as valid, no surprises there.
+
+`subscribe_returns_a_400_when_data_is_missing`, instead, is still red.
+
+Time to do some real parsing on that request body. What does axum offer us?
+
+#### 3.7.3.1 Extractors
+
+Quite prominent in axum's documentation is the [**Extractors**](https://docs.rs/axum/latest/axum/#extractors) section.
+
+Extractors are used, as the name implies, to tell the framework to extract certain pieces of information from an incoming request.
+
+Extractors are how you pick apart the incoming request to get the parts your handler needs.
+
+axum provides several extractors out of the box to cater for the most common use cases:
+
+- `Path` to get dynamic path segments from a request's path;
+- `Query` for query parameters;
+- `Json` to parse a JSON-encoded request body;
+- `HeaderMap` to get access to the request's headers;
+- `String` to get the raw request body as a string; It consumes the entire body and ensures it is valid UTF-8.
+- `Bytes` gives you the raw request body
+- `Request` gives you the whole request for maximum control
+- `Extension` extracts data from "request extensions". This is commonly used to share state across handlers.
+
+Besides these
+[`Form`](https://docs.rs/axum/latest/axum/struct.Form.html#as-extractor) can also be used as extractor to extract url-encoded form data from the request body. This is only available if you enable the `form` feature of axum. Which can be done by modifying the axum line in our `Cargo.toml`:
+
+```toml
+[dependencies]
+axum = { version = "0.8.8", features = ["form"] }
+```
+
+That's music to my ears.
+
+How do we use it?
+
+In axum, an extractor is simply a type that implements the `FromRequest` or `FromRequestParts` trait. You use it by declaring it as a parameter of your handler function — axum will deserialise the incoming request into it automatically. Argument position does not matter; axum will figure out what each argument needs.
+
+Example:
+
+```rust
+use axum::Form;
+
+#[derive(serde::Deserialize)]
+struct FormData {
+    username: String,
+}
+
+/// Extract form data using serde.
+/// This handler gets called only if the content type is *x-www-form-urlencoded*
+/// and the content of the request could be deserialized to a `FormData` struct.
+async fn index(Form(form): Form<FormData>) -> String {
+    format!("Welcome {}!", form.username)
+}
+```
+
+So, basically… you just declare it as an argument of your handler and axum, when a request comes in, will do the heavy-lifting for you. Let's ride along for now and we will circle back later to understand what is happening under the hood.
+
+Our `subscribe` handler currently looks like this:
+
+```rust
+//! src/lib.rs
+// Let's start simple: we always return a 200 OK
+async fn subscribe() -> StatusCode {
+    StatusCode::OK
+}
+```
+
+Using the example as a blueprint, we probably want something along these lines:
+
+```rust
+//! src/lib.rs
+// [...]
+#[derive(serde::Deserialize)]
+struct FormData {
+    email: String,
+    name: String,
+}
+
+async fn subscribe(_form: Form<FormData>) -> StatusCode {
+    StatusCode::OK
+}
+```
+
+`cargo check` is not happy:
+
+```sh
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `serde`
+  --> src/lib.rs:14:10
+   |
+14 | #[derive(serde::Deserialize)]
+   |          ^^^^^ use of unresolved module or unlinked crate `serde`
+
+For more information about this error, try `rustc --explain E0433`.
+```
+
+Fair enough: we need to add `serde` to our dependencies. Let's add a new line to our `Cargo.toml`:
+
+```toml
+[dependencies]
+# We need the optional `derive` feature to use `serde`'s procedural macros:
+# `#[derive(Serialize)]` and `#[derive(Deserialize)]`.
+# The feature is not enabled by default to avoid pulling in
+# unnecessary dependencies for projects that do not need it.
+serde = { version = "1.0.228", features = ["derive"] }
+```
+
+`cargo check` should succeed now. What about `cargo test`?
+
+```sh
+running 3 tests
+test health_check_works ... ok
+test subscribe_returns_a_200_for_valid_form_data ... ok
+test subscribe_returns_a_400_when_data_is_missing ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+```
+
+They are all green!
+
+But **why?**
+
+#### 3.7.3.2 `Form` and `FromRequest`
+
+Let's go straight to the source: what does `Form` look like?
+
+The _`definition`_ seems fairly innocent:
+
+```rust
+#[derive(Debug, Clone, Copy, Default)]
+#[must_use]
+pub struct Form<T>(pub T);
+```
+
+It is nothing more than a wrapper: it is generic over a type `T` which is then used to populate `Form`'s only field.
+Not much to see here.
+Where does the extraction magic take place?
+
+An extractor is a type that implements the `FromRequest` or `FromRequestParts` trait. Let's check if `Form` implements one of those traits:
+
+```rust
+/// Types that can be created from requests.
+///
+/// Extractors that implement `FromRequest` can consume the request body and can thus only be run
+/// once for handlers.
+///
+/// If your extractor doesn't need to consume the request body then you should implement
+/// [`FromRequestParts`] and not [`FromRequest`].
+pub trait FromRequest<S, M = private::ViaRequest>: Sized {
+    /// If the extractor fails it'll use this "rejection" type. A rejection is
+    /// a kind of error that can be converted into a response.
+    type Rejection: IntoResponse;
+
+    /// Perform the extraction.
+    fn from_request(
+        req: Request,
+        state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send;
+}
+```
+
+`from_request` takes as input the incoming request (i.e. `Request`) and the application state (if any) and returns a future that will resolve to either an instance of the extractor type or a rejection. It then returns `Self`, if the extraction was successful, or a `Rejection` if it failed.
+
+All arguments in the signature of a route handler must implement `FromRequest` or `FromRequestParts` for axum to be able to call the handler when a request comes in. If any of the arguments does not implement one of those traits, you will get a compile-time error.
+Axum will invoke appropriate `from_request` or `from_request_parts` implementations to extract the arguments from the incoming request before calling the handler.
+If the extraction process fails for any argument, axum will convert the corresponding `Rejection` into an HTTP response and return it to the client without calling the handler.
+
+Let's look at `Form`'s `FromRequest` implementation: what does it do?
+Once again, I slightly reshaped the _`actual code`_ to highlight the key elements and ignore the nitty gritty implementation details.
+
+```rust
+impl<T, S> FromRequest<S> for Form<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = FormRejection;
+
+    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+
+        // Step 1: Read the body and validate Content-Type header
+        // (omitted: content-type check, body size limits, streaming)
+        let RawForm(bytes) = req.extract().await?;
+
+        // Step 2: Percent-decode the bytes and deserialize into T via serde
+        // (omitted: path-aware error tracking, GET vs POST error distinction)
+        let value = serde_urlencoded::from_bytes::<T>(&bytes)
+            .map_err(|e| FormRejection::from(e))?;
+
+        Ok(Form(value))
+    }
+}
+```
+
+All the heavy-lifting seems to be split across two delegates.
+
+First, `req.extract::<RawForm>()` does a lot: it validates that the `Content-Type` header is set to `application/x-www-form-urlencoded`, deals with the fact that the request body arrives a chunk at a time as a stream of bytes, collects it all into a contiguous buffer, etc.
+
+The key passage, after all those things have been taken care of, is:
+
+```rust
+serde_urlencoded::from_bytes::<T>(&bytes)
+    .map_err(|e| FormRejection::from(e))
+```
+
+`serde_urlencoded` provides (de)serialisation support for the `application/x-www-form-urlencoded` data format.
+
+`from_bytes` takes as input a contiguous slice of bytes and it deserialises an instance of type `T` from it according to the rules of the URL-encoded format: the keys and values are encoded in key-value tuples separated by `&`, with a `=` between the key and the value; non-alphanumeric characters in both keys and values are percent encoded.
+
+How does it know how to do it for a generic type `T`?
+
+It is because `T` implements the `DeserializeOwned` trait from `serde`:
+
+```rust
+impl<T, S> FromRequest<S> for Form<T>
+where
+    T: DeserializeOwned,
+    // [...]
+```
+
+To understand what is actually happening under the hood we need to take a closer look at `serde` itself.
+
+> The next section on serde touches on a couple of advanced Rust topics.
+> It’s fine if not everything falls into place the first time you read it!
+> Come back to it once you have played with Rust and serde a bit more to deep-dive on the toughest bits of it.
+
+#### 3.7.3.3 Serialization In Rust: `serde`
+
+// Everything as it is
+
+#### 3.7.3.4 Putting Everything Together
+
+Given everything we learned so far, let's take a second look at our `subscribe` handler:
+
+```rust
+#[derive(serde::Deserialize)]
+pub struct FormData {
+    email: String,
+    name: String,
+}
+
+// Let's start simple: we always return a 200 OK
+async fn subscribe(_form: Form<FormData>) -> StatusCode {
+    StatusCode::OK
+}
+```
+
+We now have a good picture of what is happening:
+
+- before calling `subscribe`, axum invokes the `from_request` method for all of `subscribe`'s input arguments: in our case, `Form::from_request`;
+- `Form::from_request` tries to deserialise the body into `FormData` according to the rules of URL-encoding, leveraging `serde_urlencoded` and the `Deserialize` implementation of `FormData`, automatically generated for us by `#[derive(serde::Deserialize)]`;
+- if `Form::from_request` fails due to empty data a `422 Unprocessable Entity` is returned to the caller. If it succeeds, `subscribe` is invoked and we return a `200 OK`.
+
+Take a moment to be amazed: it looks so deceptively simple, yet there is so much going on in there — we are leaning heavily on Rust's strengths as well as some of the most polished crates in its ecosystem.
