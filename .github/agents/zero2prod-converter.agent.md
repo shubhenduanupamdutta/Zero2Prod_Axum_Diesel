@@ -65,3 +65,4 @@ When the book explains **why** a design decision was made (e.g. why a framework 
 - DO NOT add unsolicited explanations of axum internals beyond what the book section covers
 - Preserve the book's writing style and tone in the prose you convert
 - DO NOT compare with actix-web in the addendum — focus on explaining the axum approach as if it were the original content
+- DO NOT soft-wrap or wrap lines before paragraph ends.
