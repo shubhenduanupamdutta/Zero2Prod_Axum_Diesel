@@ -2,6 +2,14 @@
 set -x
 set -eo pipefail
 
+if ! [ -x "$(command -v diesel)" ]; then
+    echo >&2 "Error: diesel_cli is not installed."
+    echo >&2 "Use:"
+    echo >&2 "    cargo install diesel_cli --locked --no-default-features --features postgres"
+    echo >&2 "to install it."
+    exit 1
+fi
+
 # Check if a custom parameter has been set, otherwise use default values
 DB_PORT="${POSTGRES_PORT:=5432}"
 SUPERUSER="${SUPERUSER:=postgres}"
