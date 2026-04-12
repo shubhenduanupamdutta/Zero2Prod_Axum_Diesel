@@ -1,3 +1,5 @@
+pub mod schema;
+
 use axum::{
     Form,
     Router,
