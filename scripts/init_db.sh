@@ -44,3 +44,8 @@ docker exec -it "${CONTAINER_NAME}" psql -U "${SUPERUSER}" -c "${CREATE_QUERY}"
 # Grant create db privileges to the app user
 GRANT_QUERY="ALTER USER ${APP_USER} CREATEDB;"
 docker exec -it "${CONTAINER_NAME}" psql -U "${SUPERUSER}" -c "${GRANT_QUERY}"
+
+DATABASE_URL="postgres://${APP_USER}:${APP_USER_PWD}@localhost:${DB_PORT}/${APP_DB_NAME}"
+export DATABASE_URL
+
+diesel setup
