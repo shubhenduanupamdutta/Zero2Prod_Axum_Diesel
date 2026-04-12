@@ -16,7 +16,11 @@ path = "src/main.rs"
 [dependencies]
 axum = { version = "0.8.8", features = ["form"] }
 diesel = { version = "2.3.7", features = ["chrono", "uuid"] }
-diesel-async = { version = "0.8.0", features = ["postgres"] }
+diesel-async = { version = "0.8.0", features = [
+  "deadpool",
+  "migrations",
+  "postgres"
+] }
 reqwest = "0.13.2"
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.51.0", features = ["macros", "rt-multi-thread"] }
