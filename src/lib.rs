@@ -1,28 +1,17 @@
+pub mod configuration;
+pub mod routes;
 pub mod schema;
+pub mod startup;
 
 use axum::{
-    Form,
     Router,
-    http::StatusCode,
     routing::{get, post},
     serve::Serve,
 };
 use tokio::net::TcpListener;
 
+use crate::routes::{health_check, subscribe};
 
-async fn health_check() -> StatusCode {
-    StatusCode::OK
-}
-
-#[derive(serde::Deserialize)]
-struct FormData {
-    email: String,
-    name: String,
-}
-
-async fn subscribe(_form: Form<FormData>) -> StatusCode {
-    StatusCode::OK
-}
 
 pub fn run(listener: TcpListener) -> Result<Serve<TcpListener, Router, Router>, std::io::Error> {
     let app = Router::new()
