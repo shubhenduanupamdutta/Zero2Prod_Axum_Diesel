@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.8.8", features = ["form"] }
+config = "0.15.22"
 diesel = { version = "2.3.7", features = ["chrono", "uuid"] }
 diesel-async = { version = "0.8.0", features = [
   "deadpool",
