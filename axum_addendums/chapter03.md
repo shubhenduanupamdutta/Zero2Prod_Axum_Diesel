@@ -1909,3 +1909,468 @@ Please keep in mind you need to add following secrets to your GitHub repository 
 - `APP_USER`: **app** or whatever you have used in your `scripts/init_db.sh` script for the application user username
 - `PG_USER`: **postgres** or whatever you have used in your `scripts/init_db.sh` script for the Postgres superuser username
 - `PG_PASSWORD`: **password** or whatever you have used in your `scripts/init_db.sh` script for the Postgres superuser password. This would also be same in `configuration.yaml` file for the database password.
+
+---
+
+## 3.9 Persisting A New Subscriber
+
+---
+
+Just as we wrote a SELECT query to inspect what subscriptions had been persisted to the database in our test, we now need to write an INSERT query to actually store the details of a new subscriber when we receive a valid POST /subscriptions request.
+
+Let's have a look at our request handler:
+
+```rust
+//! src/routes/subscriptions.rs
+use axum::{Form, http::StatusCode};
+use serde::Deserialize;
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+pub struct FormData {
+    email: String,
+    name: String,
+}
+
+// Let's start simple: we always return a 200 OK
+pub async fn subscribe(_form: Form<FormData>) -> StatusCode {
+    StatusCode::OK
+}
+```
+
+To execute a query within `subscribe` we need to get our hands on a database connection. Let's figure out how to get one.
+
+### 3.9.1 Application State in `axum`
+
+So far our application has been entirely stateless: our handlers work solely with the data from the incoming request.
+
+axum gives us the possibility to attach to the application other pieces of data that are not related to the lifecycle of a single incoming request — the so-called application state. You can add information to the application state using the `with_state` method on `Router`, and handlers receive it via the `State<T>` extractor.
+
+Let's try to use `with_state` to register a `diesel_async` `AsyncPgConnection` as part of our application state. We need to modify our `run` function to accept a `AsyncPgConnection` alongside the `TcpListener`:
+
+```rust
+//! src/startup.rs
+use axum::{
+    Router,
+    routing::{get, post},
+    serve::Serve,
+};
+use diesel_async::AsyncPgConnection;
+use tokio::net::TcpListener;
+
+use crate::routes::{health_check, subscribe};
+
+
+pub fn run(
+    listener: TcpListener,
+    // New parameter!
+    connection: AsyncPgConnection,
+) -> Result<Serve<TcpListener, Router, Router>, std::io::Error> {
+    let app = Router::new()
+        .route("/health_check", get(health_check))
+        .route("/subscriptions", post(subscribe))
+        // Register the connection as part of the application state
+        .with_state(connection);
+    let server = axum::serve(listener, app);
+    Ok(server)
+}
+```
+
+`cargo check` is screaming at us:
+
+```sh
+error[E0277]: the trait bound `AsyncPgConnection: Clone` is not satisfied
+   --> src/startup.rs:16:15
+    |
+ 16 |     let app = Router::new()
+    |               ^^^^^^^^^^^^^ the trait `Clone` is not implemented for `AsyncPgConnection`
+    |
+note: required by a bound in `Router::<S>::new`
+   --> /home/shubhendu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/axum-0.8.9/src/routing/mod.rs:140:8
+    |
+140 |     S: Clone + Send + Sync + 'static,
+    |        ^^^^^ required by this bound in `Router::<S>::new`
+...
+```
+
+`Router::new` requires the type of the application state to implement `Clone`.
+Why does it need to implement `Clone` in the first place though?
+
+### 3.9.2 `axum` Workers
+
+Let's zoom in on our invocation of `Router::new`:
+
+```rust
+let app = Router::new()
+    .route("/health_check", get(health_check))
+    .route("/subscriptions", post(subscribe))
+```
+
+`Router::new` creates a new `Router` instance, which is a data structure that holds the configuration of our application — the routes, the handlers, and the application state. When we call `with_state`, we are attaching some data to this `Router` instance.
+
+When we call `axum::serve(listener, app)`, axum will spawn multiple worker tasks to handle incoming requests concurrently. Each worker needs to have access to the application state in order to execute the handlers correctly. To ensure that each worker can access the same application state, axum requires that the state be `Clone`-able. This way, when a new worker is spawned, it can create a clone of the application state and use it without interfering with other workers.
+
+Let's give it a try with a `Clone`-able wrapper. In Rust we can use `Arc` for this purpose: `Arc` stands for "Atomic Reference Counter" and is a thread-safe reference-counting pointer.
+`Arc<T>` is always cloneable, no matter what `T` is: cloning an `Arc` increments the number of active references and hands over a new copy of the memory address of the wrappeed value.
+
+For raw `AsyncPgConnection`, we also need to wrap it in a `Mutex` to ensure that only one worker can access the connection at a time, since `AsyncPgConnection` is not thread-safe.
+
+Handler can then access the application state using the same extractor.
+
+Let's give it a try:
+
+```rust
+//! src/startup.rs
+use std::sync::Arc;
+
+use axum::{
+    Router,
+    routing::{get, post},
+    serve::Serve,
+};
+use diesel_async::AsyncPgConnection;
+use tokio::{net::TcpListener, sync::Mutex};
+
+use crate::routes::{health_check, subscribe};
+
+
+pub fn run(
+    listener: TcpListener,
+    connection: AsyncPgConnection,
+) -> Result<Serve<TcpListener, Router, Router>, std::io::Error> {
+    // Wrap the connection in an `Arc` to share it across multiple handlers
+    let connection = Arc::new(Mutex::new(connection));
+
+    let app = Router::new()
+        .route("/health_check", get(health_check))
+        .route("/subscriptions", post(subscribe))
+        // Add the connection to the application state so it can be accessed in handlers
+        .with_state(connection.clone());
+    let server = axum::serve(listener, app);
+    Ok(server)
+}
+```
+
+It doesn't compile yet, but we just need to do a bit of house-keeping — `main.rs` is still calling `run` with only one argument:
+
+```sh
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+  --> src/main.rs:11:5
+   |
+11 |     run(listener)?.await
+   |     ^^^---------- argument #2 of type `diesel_async::pg::AsyncPgConnection` is missing
+   |
+note: function defined here
+  --> src/startup.rs:14:8
+   |
+14 | pub fn run(
+   |        ^^^
+help: provide the argument
+   |
+11 |     run(listener, /* diesel_async::pg::AsyncPgConnection */)?.await
+   |                 +++++++++++++++++++++++++++++++++++++++++++
+
+For more information about this error, try `rustc --explain E0061`.
+error: could not compile `zero2prod` (bin "zero2prod") due to 1 previous error
+```
+
+Let's fix the issue real quick:
+
+```rust
+//! src/main.rs
+use diesel_async::{AsyncConnection, AsyncPgConnection};
+use tokio::net::TcpListener;
+use zero2prod::{configuration::get_configuration, startup::run};
+
+#[tokio::main]
+async fn main() -> Result<(), std::io::Error> {
+    // Panic if we can't read configuration
+    let configuration = get_configuration().expect("Failed to read configuration.");
+    let connection = AsyncPgConnection::establish(&configuration.database.connection_string())
+        .await
+        .expect("Failed to connect to Postgres.");
+
+    let address = format!("127.0.0.1:{}", configuration.application_port);
+    let listener = TcpListener::bind(address).await?;
+    run(listener, connection)?.await
+}
+```
+
+Perfect, it compiles.
+
+### 3.9.3 The `State` Extractor
+
+We can now get our hands on an `Arc<AsyncPgConnection>` in our request handler, `subscribe` using the `State` extractor:
+
+```rust
+//! src/routes/subscriptions.rs
+use diesel_async::AsyncPgConnection;
+// [...]
+
+pub async fn subscribe(
+    // Retrieving a connection from the application state!
+    _connection: State<Arc<Mutex<AsyncPgConnection>>>,
+    _form: Form<FormData>,
+) -> StatusCode {
+    StatusCode::OK
+}
+```
+
+We called `State` an extractor, but what is it extracting a `Arc<AsyncPgConnection>` from?
+
+Axum uses a statically-typed generic container to represent application state: the `Router<S>` is explicitly parameterized by the type of state it holds.
+
+The State extractor works by leveraging the `FromRequestParts<S>` trait. When you define a handler with a `State<T>` argument, you are stating that the handler can only be mounted to a router whose state `S` can provide a `T`.
+
+When a new request comes in, the routing engine—which owns the state object—directly passes a reference to that state into the extractor's `from_request_parts` method. If the requested type `T` is a sub-component of the total state `S`, Axum utilizes the `FromRef<S>` trait to project or clone the specific data needed.
+
+Because this dependency injection is resolved through Rust’s trait system and generics, the relationship between the handler’s requirements and the router’s data is verified at compile-time. If a handler requests a state type that hasn't been provided to the router, the application will fail to compile, ensuring that all dependencies are satisfied before the binary ever runs.
+
+### 3.9.4 The `INSERT` Query
+
+We finally have a connection in `subscribe`: let's try to persist the details of our new subscriber.
+We will need to write an `INSERT` query using `diesel` DSL for this.
+We can simplify the process by using `diesel`'s macros. We can use the `Insertable` trait to automatically generate the necessary code for inserting a new record into the database.
+
+But before any of that we need to add `chrono` and `uuid` as dependencies to our project, since we will need to generate a unique ID for each subscriber and also store the timestamp of when they subscribed.
+
+```toml
+[dependencies]
+# [...]
+chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
+uuid = { version = "1.23.0", features = ["v4"] }
+```
+
+or
+
+```sh
+cargo add chrono --no-default-features --features clock
+cargo add uuid --features v4
+```
+
+Now let's modify the handler.
+
+```rust
+//! src/routes/subscriptions.rs
+// [...]
+use chrono::{DateTime, Utc};
+use diesel::prelude::Insertable;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use uuid::Uuid;
+
+use crate::schema::subscriptions;
+
+// [...]
+
+type DbConnection = Arc<Mutex<AsyncPgConnection>>;
+
+#[derive(Insertable)]
+#[diesel(table_name = subscriptions)]
+struct InsertSubscription {
+    id: Uuid,
+    email: String,
+    name: String,
+    subscribed_at: DateTime<Utc>,
+}
+
+
+pub async fn subscribe(
+    State(connection): State<DbConnection>,
+    Form(form): Form<FormData>,
+) -> StatusCode {
+    let mut connection = connection.lock().await;
+    let new_subscriber = InsertSubscription {
+        id: Uuid::new_v4(),
+        email: form.email,
+        name: form.name,
+        subscribed_at: Utc::now(),
+    };
+    diesel::insert_into(subscriptions::table)
+        .values(&new_subscriber)
+        .execute(&mut *connection)
+        .await
+        .expect("Failed to execute query.");
+    StatusCode::OK
+}
+```
+
+Let's unpack what is happening here:
+
+- We define a new struct `InsertSubscription` that represents the data we want to insert into the `subscriptions` table. We derive the `Insertable` trait for this struct, which allows us to use it with Diesel's query builder.
+- In the `subscribe` handler, we first acquire a lock on the database connection to ensure that only one request can access it at a time.
+- We create a new instance of `InsertSubscription` with the data from the form and some generated values (a new UUID and the current timestamp).
+- We then use Diesel's `insert_into` function to construct an `INSERT` query, passing in our new subscriber. We execute the query asynchronously and handle any potential errors.
+- Finally, we return a `200 OK` status code to indicate that the subscription was successful.
+
+As you can see we needed to use `Mutex` for this to work, but this is not ideal. This makes so that there can only be one request accessing the database at a time, which can lead to performance issues under high load. This is happening because `execute` method on `AsyncPgConnection` requires a mutable reference to the connection, which means that we cannot share the same connection across multiple requests without some form of synchronization.
+
+So here comes connection pooling to the rescue. We can use `deadpool` to manage a pool of database connections, allowing multiple requests to access the database concurrently without blocking each other. When we run a query against this pool, it will automatically acquire a connection from the pool, execute the query, and then return the connection back to the pool for reuse. This way we can avoid the bottleneck of having a single connection and improve the performance of our application under load. If not connections are available, the request will either create or wait for a connection to become available, depending on the configuration of the pool.
+
+So let's refactor our code to use `deadpool` for connection pooling instead of a single `AsyncPgConnection` wrapped in a `Mutex`.
+This will also allow to fully utilize the advantage of and ORM, since this way, we only change the backend at few places and our code will run for all the supported databases without any change.
+
+```rust
+//! src/main.rs
+use diesel_async::{
+    AsyncPgConnection,
+    pooled_connection::{AsyncDieselConnectionManager, deadpool::Pool},
+};
+use tokio::net::TcpListener;
+use zero2prod::{configuration::get_configuration, startup::run};
+
+#[tokio::main]
+async fn main() -> Result<(), std::io::Error> {
+    // Panic if we can't read configuration
+    let configuration = get_configuration().expect("Failed to read configuration.");
+    let db_config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        &configuration.database.connection_string(),
+    );
+    let pool = Pool::builder(db_config)
+        .build()
+        .expect("Failed to create connection pool.");
+
+    let address = format!("127.0.0.1:{}", configuration.application_port);
+    let listener = TcpListener::bind(address).await?;
+    run(listener, pool)?.await
+}
+```
+
+```rust
+//! src/lib.rs
+use diesel_async::{AsyncPgConnection, pooled_connection::deadpool};
+
+pub mod configuration;
+pub mod routes;
+pub mod schema;
+pub mod startup;
+
+pub type DbPool = deadpool::Pool<AsyncPgConnection>;
+```
+
+```rust
+//! src/startup.rs
+use axum::{
+    Router,
+    routing::{get, post},
+    serve::Serve,
+};
+use tokio::net::TcpListener;
+
+use crate::{
+    DbPool,
+    routes::{health_check, subscribe},
+};
+
+pub fn run(
+    listener: TcpListener,
+    pool: DbPool,
+) -> Result<Serve<TcpListener, Router, Router>, std::io::Error> {
+
+let app = Router::new()
+        .route("/health_check", get(health_check))
+        .route("/subscriptions", post(subscribe))
+        // Add the connection to the application state so it can be accessed in handlers
+        .with_state(pool);
+    let server = axum::serve(listener, app);
+    Ok(server)
+}
+```
+
+```rust
+//! src/routes/subscriptions.rs
+// [...]
+use crate::{DbPool, schema::subscriptions};
+
+// [...]
+
+pub async fn subscribe(State(pool): State<DbPool>, Form(form): Form<FormData>) -> StatusCode {
+    let new_subscriber = InsertSubscription {
+        id: Uuid::new_v4(),
+        email: form.email,
+        name: form.name,
+        subscribed_at: Utc::now(),
+    };
+
+    let mut conn = pool
+        .get()
+        .await
+        .expect("Failed to get a connection from the pool.");
+
+    diesel::insert_into(subscriptions::table)
+        .values(&new_subscriber)
+        .execute(&mut conn)
+        .await;
+
+    StatusCode::OK
+}
+```
+
+The compiler is _almost_ happy: `cargo check` has a warning for us.
+
+```sh
+warning: unused `Result` that must be used
+  --> src/routes/subscriptions.rs:40:5
+   |
+40 | /     diesel::insert_into(subscriptions::table)
+41 | |         .values(&new_subscriber)
+42 | |         .execute(&mut conn)
+43 | |         .await;
+   | |______________^
+   |
+   = note: this `Result` may be an `Err` variant, which should be handled
+   = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+   |
+40 |     let _ = diesel::insert_into(subscriptions::table)
+   |     +++++++
+```
+
+This `INSERT` operation may fail - it returns a `Result`, Rust's way to model fallible functions. The compiler is reminding us to handle the error case - let's follow the advice:
+
+```rust
+//! src/routes/subscriptions.rs
+// [...]
+
+pub async fn subscribe(State(pool): State<DbPool>, Form(form): Form<FormData>) -> StatusCode {
+    // [...]
+
+    // `Result` has two variants: `Ok` and `Err`.
+    // The first for successes, the second for failures.
+    // We use a `match` statement to choose what to do based
+    // on the outcome.
+    // We will talk more about `Result` going forward!
+    match diesel::insert_into(subscriptions::table)
+        .values(&new_subscriber)
+        .execute(&mut conn)
+        .await
+    {
+        Ok(_) => StatusCode::OK,
+        Err(e) => {
+            eprintln!("Failed to execute query: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        },
+    }
+}
+```
+
+`cargo check` is satisfied, but the same cannot be said for `cargo test`:
+
+```sh
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+  --> tests/health_check.rs:20:18
+   |
+20 |     let server = zero2prod::startup::run(listener).expect("Failed to start server");
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^---------- argument #2 of type `deadpool::managed::pool::Pool<AsyncDieselConnectionManager<AsyncPgConnection>>` is missing
+   |
+note: function defined here
+  --> src/startup.rs:13:8
+   |
+13 | pub fn run(
+   |        ^^^
+help: provide the argument
+   |
+20 |     let server = zero2prod::startup::run(listener, /* deadpool::managed::pool::Pool<AsyncDieselConnectionManager<AsyncPgConnection>> */).expect("Failed to start server");
+   |                                                  ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+For more information about this error, try `rustc --explain E0061`.
+```
