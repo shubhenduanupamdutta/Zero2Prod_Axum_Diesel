@@ -1,4 +1,7 @@
+use diesel::prelude::*;
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use tokio::net::TcpListener;
+use zero2prod::{configuration::get_configuration, schema::subscriptions};
 
 /// Spawns the application and returns the address (including port) that it is listening on.
 ///
@@ -45,7 +48,13 @@ async fn health_check_works() {
 async fn subscribe_returns_a_200_for_valid_form_data() {
     // Arrange
     let app_address = spawn_app().await;
+    let configuration = get_configuration().expect("Failed to read configuration.");
+    let connection_string = configuration.database.connection_string();
+    let mut connection = AsyncPgConnection::establish(&connection_string)
+        .await
+        .expect("Failed to connect to Postgres.");
     let client = reqwest::Client::new();
+
     // Act
     let body = "name=le%20guin&email=ursula_le_guin%40gmail.com";
     let response = client
@@ -55,8 +64,19 @@ async fn subscribe_returns_a_200_for_valid_form_data() {
         .send()
         .await
         .expect("Failed to execute request.");
+
     // Assert
     assert_eq!(200, response.status().as_u16());
+
+    // Get saved subscriber for database
+    let (email, name) = subscriptions::table
+        .select((subscriptions::email, subscriptions::name))
+        .first::<(String, String)>(&mut connection)
+        .await
+        .expect("Failed to get saved subscription.");
+
+    assert_eq!(email, "ursula_le_guin@gmail.com");
+    assert_eq!(name, "le guin");
 }
 
 #[tokio::test]
