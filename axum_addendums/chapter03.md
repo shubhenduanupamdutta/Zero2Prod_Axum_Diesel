@@ -1242,3 +1242,670 @@ We now have a good picture of what is happening:
 - if `Form::from_request` fails due to empty data a `422 Unprocessable Entity` is returned to the caller. If it succeeds, `subscribe` is invoked and we return a `200 OK`.
 
 Take a moment to be amazed: it looks so deceptively simple, yet there is so much going on in there — we are leaning heavily on Rust's strengths as well as some of the most polished crates in its ecosystem.
+
+---
+
+## 3.8 Storing Data: Databases
+
+---
+
+// Intro as it is
+
+### 3.8.1 Choosing A Database
+
+// Everything as it is
+
+### 3.8.2 Choosing A Database Crate
+
+As of March 2026, there are four top-of-mind options when it comes to interacting with PostgreSQL in a Rust project:
+
+- `tokio-postgres`
+- `sqlx`
+- `diesel`
+- `SeaORM`
+
+For this book we will use `diesel` with `diesel-async`.
+
+With `diesel`, you build queries using a type-safe Rust DSL generated from your database schema. This may sound more involved than writing raw SQL, but it comes with a meaningful upside: your queries are expressed as ordinary Rust code and inherit all of the guarantees the compiler can offer.
+
+SQL is fraught with pitfalls, though. It is fairly easy to make mistakes when writing queries. We might, for example,
+
+- have a typo in the name of a column or a table mentioned in our query;
+- try to perform operations that are rejected by the database engine (e.g. summing a string and a number
+  or joining two tables on the wrong column);
+- expect to have a certain field in the returned data that is actually not there.
+
+The key question is: **when** do we realise we made a mistake?
+
+In most programming languages, it will be at **runtime**: when we try to execute our query the database will reject it and we will get an error or an exception. `diesel` speeds up the feedback cycle by catching most of these mistakes **at compile time**. It works by running `diesel print-schema` (or `diesel migration run`) to generate a `schema.rs` file that encodes your database table structure as Rust types. The DSL methods — `filter`, `select`, `inner_join`, and friends — are all generic over those generated types, so referring to a non-existent column, mismatching types across a join, or expecting a field that is not in the schema
+all become compiler errors rather than runtime surprises.
+
+Enough with the introduction though, it'll be easier to understand how `diesel` works by looking at it in action.
+
+### 3.8.3 Integration Testing With Side-effects
+
+// Everything as it is
+
+### 3.8.4 Database Setup
+
+// Intro as it is
+
+#### 3.8.4.1 Docker
+
+// Everything as it is
+
+#### 3.8.4.2 User Management
+
+// Everything as it is
+
+#### 3.8.4.3 Database Migration
+
+To store our subscriber details we need to create our first table.
+To add a new table to our database we need to change its _`schema`_ - this is commonly referred to as a _database migration_.
+
+##### 3.8.4.3.1 `diesel_cli`
+
+`diesel` provides a command-line tool, `diesel_cli`, that helps us manage our database schema. It can be installed with:
+
+```sh
+cargo install diesel_cli --locked --no-default-features --features postgres
+```
+
+This may sometime throw an error about `libpq` not being found. In that case installing `libpq-dev` with your system's package manager should do the trick.
+
+For example, on Debian-based Linux distributions you can run:
+
+```sh
+sudo apt-get install libpq-dev
+```
+
+##### 3.8.4.3.2 Database Creation
+
+The first command we will usually want to run is `diesel setup`.
+
+According to the `diesel` cli help, the `setup` command does the following:
+
+```sh
+diesel setup -h
+Creates the migrations directory, creates the database specified in your DATABASE_URL, and runs existing migrations.
+```
+
+This will create the database specified in our `DATABASE_URL` environment variable and run any pending migrations (we don't have any yet, so it won't do much at this point). It also creates a `migrations` directory in our project where we will keep all of our migration files. By default, it also creates on initial migration which establishes starting point for database schema. You shouldn't delete it. It just keeps two utility function in our database.
+
+You can also add the environment variable to your `.env` file, and `diesel` will pick it up automatically. Mind you this must be a valid connection string for your database, otherwise you will get an error when running `diesel setup`:
+
+```.env
+DATABASE_URL=postgres://postgres:password@localhost/newsletter
+```
+
+Now we can add couple of lines in our `scripts/init_db.sh` file for automatically running `diesel setup`
+
+```sh
+# [...]
+
+DATABASE_URL=postgres://${APP_USER}:${APP_PASSWORD}@localhost/${APP_DB}
+export DATABASE_URL
+diesel setup
+```
+
+This will also create a `diesel.toml` file in the root of our project with the following content:
+
+```toml
+# For documentation on how to configure this file,
+# see https://diesel.rs/guides/configuring-diesel-cli
+
+[print_schema]
+file = "src/schema.rs"
+custom_type_derives = ["diesel::query_builder::QueryId", "Clone"]
+
+[migrations_directory]
+dir = "migrations"
+```
+
+This can be used to configure the behavior of `diesel_cli` - for example, we can change the location of the generated `schema.rs` file or the directory where our migration files are stored.
+
+Scripts do not come bundled with a manifest to declare their dependencies: it's unfortunately very common to launch a script without having installed all the prerequisites. This will usually result in the script crashing mid-execution, sometimes leaving stuff in our system in a half-broken state. We can do better in our initialization script: let's check if `diesel-cli` is installed at the very beginning.
+
+```sh
+set -x
+set -eo pipefail
+
+if ! [ -x "$(command -v diesel)" ]; then
+    echo >&2 "Error: diesel_cli is not installed."
+    echo >&2 "Use:"
+    echo >&2 "    cargo install diesel_cli --locked --no-default-features --features postgres"
+    echo >&2 "to install it."
+    exit 1
+fi
+
+# The rest of the script goes here
+```
+
+##### 3.8.4.3.3 Adding a migration
+
+Let's create our first migration now with
+
+```sh
+# Assuming you have set DATABASE_URL with default parameters of the script in .env or in environment variables
+diesel migration generate create_subscriptions_table
+```
+
+Migrations allow us to evolve the database schema over time. Each migration consists of an **up.sql** file to apply the changes and a **down.sql** file to revert them. Applying and immediately reverting a migration should leave your database schema unchanged.
+
+A new directory will be created in `migrations` with a timestamp and the name of the migration, e.g. `{timestamp}-0000_create_subscriptions_table`. Inside it, you will find the two files mentioned above.
+Format of the timestamp is `{year}-{month}-{day}-{time:HHMMSS}`. The timestamp is used to determine the order of the migrations: they will be applied in chronological order.
+Let's edit the `up.sql` file to create a `subscriptions` table with the following schema:
+
+```sql
+-- migrations/{timestamp}_create_subscriptions_table/up.sql
+-- This is the "up" migration for creating the subscriptions table
+CREATE TABLE subscriptions (
+    id uuid NOT NULL,
+    PRIMARY KEY (id),
+    email TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    subscribed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+Now for `down.sql`:
+
+```sql
+-- migrations/{timestamp}_create_subscriptions_table/down.sql
+-- This is the "down" migration for dropping the subscriptions table
+DROP TABLE IF EXISTS subscriptions;
+```
+
+There is an [endless debate](https://z2p.io/fxh) when it comes to [primary keys](https://z2p.io/fxg): some people prefer to use columns with a business meaning (e.g. email, a _natural key_), others feel safer with a synthetic key without any business meaning (e.g. id, a randomly generated UUID, a _surrogate key_).
+
+I generally default to a synthetic identifier unless I have a very compelling reason not to - feel free to disagree with me here.
+
+A couple of other things to make a note of:
+
+- we are keeping track of when a subscription is created with `subscribed_at` (`TIMESTAMPTZ` is a timezone aware date and time type);
+- we are enforcing email uniqueness at the database-level with a `UNIQUE` constraint;
+- we are enforcing that all fields should be populated with a `NOT NULL` constraint on each column;
+- we are using `TEXT` for email and name because we do not have any restriction on their maximum lengths.
+
+Database constraints are useful as a last line of defence from application bugs but they come at a cost - the database has to ensure all checks pass before writing new data into the table. Therefore constraints impact our write-throughput, i.e. the number of rows we can `INSERT`/`UPDATE` per unit of time in a table.
+
+`UNIQUE`, in particular, introduces an additional B-tree index on our `email` column: the index has to be updated on every `INSERT`/`UPDATE`/`DELETE` query and it takes space on disk.
+
+In our specific case, I would not be too worried: our mailing list would have to be **incredibly popular** for us to encounter issues with our write throughput. Definitely a good problem to have, if it comes to that.
+
+##### 3.8.4.3.4 Running Migrations
+
+We can run migrations against our database with
+
+```sh
+diesel migration run
+```
+
+This will look at the `migrations` directory and apply any pending migrations to the database specified in our `DATABASE_URL` environment variable. It will also create a `__diesel_schema_migrations` table in our database to keep track of which migrations have been applied.
+It will also create a `schema.rs` file in `src` with the following content:
+
+```rust
+// @generated automatically by Diesel CLI.
+
+diesel::table! {
+    subscriptions (id) {
+        id -> Uuid,
+        email -> Text,
+        name -> Text,
+        subscribed_at -> Timestamptz,
+    }
+}
+```
+
+This file is generated by `diesel` and should not be edited manually. It encodes our database schema as Rust types and is used by the `diesel` DSL to provide type safety for our queries.
+This needs to be added to our `src/lib.rs` file to be available in our codebase:
+
+```rust
+// src/lib.rs
+pub mod schema;
+
+[...]
+```
+
+It's a good idea to make sure that **down.sql** is correct. You can quickly confirm that your **down.sql** rolls back your migration correctly by **redoing** the migration:
+
+```sh
+diesel migration redo
+```
+
+It has the same behavior of `diesel setup` it will look at the `DATABASE_URL` environment variable to understand what database needds to be migrated.
+
+It will be last addition to our `scripts/init_db.sh` script, which should now look like this:
+
+```sh
+#!/usr/bin/env bash
+set -x
+set -eo pipefail
+
+if ! [ -x "$(command -v diesel)" ]; then
+    echo >&2 "Error: diesel_cli is not installed."
+    echo >&2 "Use:"
+    echo >&2 "    cargo install diesel_cli --locked --no-default-features --features postgres"
+    echo >&2 "to install it."
+    exit 1
+fi
+
+# Check if a custom parameter has been set, otherwise use default values
+DB_PORT="${POSTGRES_PORT:=5432}"
+SUPERUSER="${SUPERUSER:=postgres}"
+SUPERUSER_PWD="${SUPERUSER_PWD:=password}"
+
+APP_USER="${APP_USER:=app}"
+APP_USER_PWD="${APP_USER_PWD:=secret}"
+APP_DB_NAME="${APP_DB_NAME:=newsletter}"
+
+# Launch postgres using Docker
+CONTAINER_NAME="postgres_zero2prod_axum_diesel"
+docker run \
+    -e POSTGRES_USER="$SUPERUSER" \
+    -e POSTGRES_PASSWORD="$SUPERUSER_PWD" \
+    --health-cmd="pg_isready -U ${SUPERUSER} || exit 1" \
+    --health-interval=1s \
+    --health-timeout=5s \
+    --health-retries=5 \
+    -p "$DB_PORT:5432" \
+    -d \
+    --name "${CONTAINER_NAME}" \
+    postgres:14-alpine -N 1000
+    # ^ Increased maximum number of connections for testing purposes
+
+# Wait for Postgres to be ready to accept connections
+until [ \
+    "$(docker inspect -f "{{.State.Health.Status}}" ${CONTAINER_NAME})" == \
+    "healthy" \
+]; do
+    >&2 echo "Waiting for Postgres to be healthy...- sleeping for 1 second"
+    sleep 1
+done
+
+>&2 echo "Postgres is healthy and ready to accept connections on PORT ${DB_PORT}!"
+
+# Create the application user
+CREATE_QUERY="CREATE USER ${APP_USER} WITH PASSWORD '${APP_USER_PWD}';"
+docker exec -it "${CONTAINER_NAME}" psql -U "${SUPERUSER}" -c "${CREATE_QUERY}"
+
+# Grant create db privileges to the app user
+GRANT_QUERY="ALTER USER ${APP_USER} CREATEDB;"
+docker exec -it "${CONTAINER_NAME}" psql -U "${SUPERUSER}" -c "${GRANT_QUERY}"
+
+DATABASE_URL="postgres://${APP_USER}:${APP_USER_PWD}@localhost:${DB_PORT}/${APP_DB_NAME}"
+export DATABASE_URL
+
+diesel setup
+diesel migration run
+
+>&2 echo "Postgres has been migrated, 'ready to go!'"
+```
+
+We have put the `docker run` invocation behind the `SKIP_DOCKER` flag to make it easy to run migrations against an existing Postgres instance without having to tear it down manually and re-create it with `scripts/init_db.sh`. It will also be useful in CI, if Postgres is not spun up by our script.
+
+We can now initialise a running database with
+
+```sh
+SKIP_DOCKER=true ./scripts/init_db.sh
+```
+
+You should be able to spot, in the output, something like
+
+```sh
+> diesel migration run
+Running migration 2026-04-12-124918-0000_create_subscriptions_table
+```
+
+If you check your database using [your favourite graphic interface](https://z2p.io/f6f) for Postgres you will now see a `subscriptions` table alongside a brand new `__diesel_schema_migrations` table: this is where `diesel` keeps track of what migrations have been run against your database - it should contain a single row now for our `create_subscriptions_table` migration.
+
+### 3.8.5 Writing Our First Query
+
+We have migrated database up and running. How do we talk to it?
+
+#### 3.8.5.1 `diesel` and `diesel-async`
+
+We have installed `diesel_cli` but we have actually not yet added `diesel` as a dependency to our application. Before appending it to our `Cargo.toml` file, let's take a moment to understand what `diesel` and `diesel-async` are.
+
+`diesel` is the core library that provides the DSL for building queries and the code generation for our schema. It is synchronous and blocking by default, which means that it will block the thread while waiting for a response from the database. This is not ideal for a web application where we want to be able to handle multiple requests concurrently without blocking the entire server.
+
+`diesel-async` is an extension of `diesel` that provides asynchronous support. It allows us to run our queries without blocking the thread, which is essential for building a responsive web application. It has drop in replacement for diesel functionality that actually interacts with database. Notably it provides drop in replacement for the `RunQueryDsl` and `Connection` traits. It also has inbuilt integration with connection pooling libraries like `bb8` and `deadpool`.
+
+Now let's add both `diesel` and `diesel-async` to our `Cargo.toml` file:
+
+```toml
+[dependencies]
+diesel = { version = "2.3.7", features = ["chrono", "uuid"] }
+diesel-async = { version = "0.8.0", features = [
+  "deadpool",
+  "migrations",
+  "postgres"
+] }
+```
+
+Or we can use cargo add:
+
+```sh
+cargo add diesel@2.3.7 --features chrono,uuid
+cargo add diesel-async@0.8.0 --features deadpool,migrations,postgres
+```
+
+There are a few features flag. Let's go through them one by one:
+
+- `chrono`: this feature enables support for the `chrono` crate, which provides date and time types. We need this to work with our `subscribed_at` column, which is of type `TIMESTAMPTZ`.
+- `uuid`: this feature enables support for the `uuid` crate, which provides a type for working with UUIDs. We need this to work with our `id` column, which is of type `uuid`.
+- `postgres`: this feature enables support for PostgreSQL in `diesel-async`. We need this to be able to use `diesel-async` with our PostgreSQL database.
+- `migrations`: Enables the [AsyncMigrationHarness](https://docs.rs/diesel-async/0.8.0/diesel_async/struct.AsyncMigrationHarness.html) to execute migrations via [diesel_migrations](https://docs.rs/diesel_migrations/2.3.1/diesel_migrations/)
+- `deadpool`: this feature enables support for the [`deadpool`](https://docs.rs/deadpool/0.13.0/x86_64-unknown-linux-gnu/deadpool/index.html) connection pooling library. We will use `deadpool` to manage our database connections in an efficient way.
+
+This should be enough for now.
+
+#### 3.8.5.2 Configuration Management
+
+The simplest entrypoint to connect to a Postgres database with `diesel-async` is [`AsyncPgConnection`](https://docs.rs/diesel-async/latest/diesel_async/struct.AsyncPgConnection.html).
+
+`AsyncPgConnection` can be created via `AsyncPgConnection::establish`, which takes a connection string and returns a `Result<AsyncPgConnection, ConnectionError>`. This doesn't natively support TLS connections. We will cover later on how to setup TLS connections.
+
+Where do we get a connection string?
+
+We could hard-code one in our application and then use it for our tests as well. Or we could choose to introduce immediately some basic mechanism of configuration management.
+
+It is simpler than it sounds and it will save us the cost of tracking down a bunch of hard-coded values across the whole application.
+
+The [`config`](https://docs.rs/config/latest/config/) crate is Rust's swiss-army knife when it comes to configuration: it supports multiple file formats and it lets you combine different sources hierarchically (e.g. environment variables, configuration files, etc.) to easily customise the behaviour of your application for each deployment environment.
+
+We do not need anything fancy for the time being: a single configuration file will do.
+
+##### 3.8.5.2.1 Making Space
+
+// Everything as it is
+
+##### 3.8.5.2.2 Reading a Configuration File
+
+To manage configuration with `config` we must represent our application settings as a Rust type that implements `serde`'s `Deserialize` trait.
+Let's create a new `Settings` struct:
+
+```rust
+//! src/configuration.rs
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+pub struct Settings {}
+```
+
+We have two groups of configuration values at the moment:
+
+- the application port, where `axum` is listening for incoming requests (currently hard-coded to `8000` in `main.rs`);
+- the database connection parameters.
+
+Let's add a field for each of them to `Settings`:
+
+```rust
+//! src/configuration.rs
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+pub struct Settings {
+    pub database: DatabaseSettings,
+    pub application_port: u16,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct DatabaseSettings {
+    pub username: String,
+    pub password: String,
+    pub port: u16,
+    pub host: String,
+    pub database_name: String,
+}
+```
+
+We need `#[derive(Deserialize)]` on top of `DatabaseSettings` otherwise the compiler will complain with
+
+```sh
+error[E0277]: the trait bound
+    `configuration::DatabaseSettings: configuration::_::_serde::Deserialize<'_>`
+    is not satisfied
+ --> src/configuration.rs:3:5
+  |
+3 |     pub database: DatabaseSettings,
+  |     ^^^ the trait `configuration::_::_serde::Deserialize<'_>`
+  |         is not implemented for `configuration::DatabaseSettings`
+  |
+  = note: required by `configuration::_::_serde::de::SeqAccess::next_element`
+```
+
+It makes sense: all fields in a type have to be deserialisable in order for the type as a whole to be deserialisable.
+
+We have our configuration type, what now?
+
+First of all, let's add `config` to our dependencies with
+
+```toml
+#! Cargo.toml
+# [...]
+[dependencies]
+config = "0.15.22"
+# [...]
+```
+
+or
+
+```sh
+cargo add config@0.15.22
+```
+
+We want to read our application settings from a configuration file named `configuration.yaml`:
+
+```rust
+//! src/configuration.rs
+// [...]
+pub fn get_configuration() -> Result<Settings, config::ConfigError> {
+    // Initialise our configuration reader
+    let settings = config::Config::builder()
+        // Add configuration values from a file named `configuration.yaml`.
+        .add_source(
+            config::File::new("configuration.yaml", config::FileFormat::Yaml)
+        )
+        .build()?;
+
+    // Try to convert the configuration values it read into
+    // our Settings type
+    settings.try_deserialize::<Settings>()
+}
+```
+
+Let's modify our `main` function to read configuration as its first step:
+
+```rust
+//! src/main.rs
+use tokio::net::TcpListener;
+use zero2prod::{configuration::get_configuration, run};
+
+#[tokio::main]
+async fn main() -> Result<(), std::io::Error> {
+    // Panic if we can't read configuration
+    let configuration = get_configuration().expect("Failed to read configuration.");
+
+    // we have removed the hard-coded `8000` - it's now coming from our settings!
+    let address = format!("127.0.0.1:{}", configuration.application_port);
+    let listener = TcpListener::bind(address).await?;
+    run(listener)?.await
+}
+```
+
+If you try to launch the application with `cargo run` it should crash:
+
+```sh
+     Running `target/debug/zero2prod`
+
+thread 'main' (17014) panicked at src/main.rs:7:45:
+Failed to read configuration.: configuration file "configuration.yaml" not found
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+Let's fix it by adding a configuration file.
+
+We can use any file format for it, as long as `config` knows how to deal with it: we will go for YAML.
+
+```yaml
+# configuration.yaml
+application_port: 8000
+database:
+  host: "127.0.0.1"
+  port: 5432
+  username: "postgres"
+  password: "password"
+  database_name: "newsletter"
+```
+
+`cargo run` should now execute smoothly.
+
+#### 3.8.5.3 Connecting to Postgres
+
+There is two steps to connect to Postgres without TLS with `diesel-async` and `deadpool`.
+First create a connection manager `AsyncDieselConnectionManager` which takes in database connection string as a single string. And then create a connection pool `Pool` with the connection manager as a parameter.
+
+But `DatabaseSettings` provides us with a granular access to all the connection parameters. Let's add a convenient `connection_string` method to do it:
+
+```rust
+//! src/configuration.rs
+// [...]
+impl DatabaseSettings {
+    pub fn connection_string(&self) -> String {
+        format!(
+            "postgres://{}:{}@{}:{}/{}",
+            self.username, self.password, self.host, self.port, self.database_name
+        )
+    }
+}
+```
+
+We are finally ready to connect!
+Let's tweak our happy case test:
+In case of test let's connect to database without `deadpool` connection pool for simplicity. We will add connection pooling later.
+Direct connection is established with `AsyncPgConnection::establish` method, which takes in database connection string and returns a `Result<AsyncPgConnection, ConnectionError>`.
+
+```rust
+//! tests/health_check.rs
+use diesel_async::{AsyncConnection, AsyncPgConnection};
+use zero2prod::configuration::get_configuration;
+// [...]
+
+#[tokio::test]
+async fn subscribe_returns_a_200_for_valid_form_data() {
+    // Arrange
+    let app_address = spawn_app().await;
+    let configuration = get_configuration().expect("Failed to read configuration.");
+    let connection_string = configuration.database.connection_string();
+    let connection = AsyncPgConnection::establish(&connection_string)
+        .await
+        .expect("Failed to connect to Postgres.");
+    let client = reqwest::Client::new();
+
+    // Act
+    let body = "name=le%20guin&email=ursula_le_guin%40gmail.com";
+    let response = client
+        .post(format!("{}/subscriptions", &app_address))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .expect("Failed to execute request.");
+
+    // Assert
+    assert_eq!(200, response.status().as_u16());
+}
+```
+
+And... `cargo test` works!
+We just confirmed that we can successfully connect to Postgres from our tests!
+A small step for the world, a huge leap forward for us.
+
+#### 3.8.5.4 Our Test Assertion
+
+Now that we are connected, we can finally write the test assertions we have been dreaming about for the past 10 pages.
+We will use `diesel` DSL to build a query that checks if the subscription we just added is actually in the database.
+And we will import `diesel_async`'s `RunQueryDsl` trait to be able to execute our query asynchronously.
+We have used `select` to specify the columns we want to retrieve from the database, `first` to get the first result of the query and `expect` to panic if there is an error executing the query or if there are no results.
+We need to provide `<(String, String)>` as a type annotation to `first` because it needs to know what type to deserialize the result into and it cannot infer it from the context.
+
+```rust
+//! tests/health_check.rs
+use diesel::prelude::*;
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use zero2prod::schema::subscriptions;
+// [...]
+
+#[tokio::test]
+async fn subscribe_returns_a_200_for_valid_form_data() {
+    // [...]
+
+    // The connection has to be marked as mutable, since `RunQueryDsl` methods take `&mut connection`
+    let mut connection = AsyncPgConnection::establish(&connection_string)
+        .await
+        .expect("Failed to connect to Postgres.");
+
+    // Assert
+    assert_eq!(200, response.status().as_u16());
+
+    // Assert
+    assert_eq!(200, response.status().as_u16());
+
+    // Get saved subscriber for database
+    let (email, name) = subscriptions::table
+        .select((subscriptions::email, subscriptions::name))
+        .first::<(String, String)>(&mut connection)
+        .await
+        .expect("Failed to get saved subscription.");
+
+    assert_eq!(email, "ursula_le_guin@gmail.com");
+    assert_eq!(name, "le guin");
+```
+
+We have given `<(String, String)>` to make sure that return type of the query is a tuple of two strings, which is what we expect to get from the database. The first string is the email and the second string is the name.
+
+Keep in mind if `schema.rs` file is not up to date with the database schema, you might get an error. `Diesel` relies on `schema.rs` to provide type safety for our queries, so if there is a mismatch between the actual database schema and the generated `schema.rs` file, you might get an error when trying to execute a query. If you encounter such an error, make sure to run `diesel migration run` to update your database schema and regenerate the `schema.rs` file.
+
+Let's try to run `cargo test` again:
+
+```sh
+     Running tests/health_check.rs (target/debug/deps/health_check-7e280d9396808847)
+
+running 3 tests
+test subscribe_returns_a_400_when_data_is_missing ... ok
+test health_check_works ... ok
+test subscribe_returns_a_200_for_valid_form_data ... FAILED
+
+failures:
+
+---- subscribe_returns_a_200_for_valid_form_data stdout ----
+
+thread 'subscribe_returns_a_200_for_valid_form_data' (72748) panicked at tests/health_check.rs:76:10:
+Failed to get saved subscription.: NotFound
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    subscribe_returns_a_200_for_valid_form_data
+```
+
+It failed, which is exactly what we wanted!
+We can now focus on patching the application to turn it green.
+
+#### 3.8.5.5 Updating Our CI Pipeline
+
+If you check on it, you will notice that your CI pipeline is now failing to perform most of the checks we introduced at the beginning of our journey.
+
+Our tests now rely on a running Postgres database to be executed properly.
+
+We do not want to venture further with a broken CI.
+
+You can find an updated version of the GitHub Actions setup [on GitHub](hhttps://github.com/shubhenduanupamdutta/Zero2Prod_Axum_Diesel/tree/root-chapter03-part0/.github/workflows).
+
+Please keep in mind you need to add following secrets to your GitHub repository for the CI pipeline to work:
+
+- `APP_PASSWORD`: **secret** or whatever you have used in your `scripts/init_db.sh` script for the application user password
+- `APP_USER`: **app** or whatever you have used in your `scripts/init_db.sh` script for the application user username
+- `PG_USER`: **postgres** or whatever you have used in your `scripts/init_db.sh` script for the Postgres superuser username
+- `PG_PASSWORD`: **password** or whatever you have used in your `scripts/init_db.sh` script for the Postgres superuser password. This would also be same in `configuration.yaml` file for the database password.
