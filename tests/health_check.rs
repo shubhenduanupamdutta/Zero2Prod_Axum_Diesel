@@ -17,7 +17,7 @@ async fn spawn_app() -> String {
         .await
         .expect("Failed to bind to address");
     let port = listener.local_addr().unwrap().port();
-    let server = zero2prod::run(listener).expect("Failed to start server");
+    let server = zero2prod::startup::run(listener).expect("Failed to start server");
     let _server_handle = tokio::spawn(server.into_future());
 
     format!("http://127.0.0.1:{}", port)
