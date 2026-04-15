@@ -1901,7 +1901,7 @@ Our tests now rely on a running Postgres database to be executed properly.
 
 We do not want to venture further with a broken CI.
 
-You can find an updated version of the GitHub Actions setup [on GitHub](hhttps://github.com/shubhenduanupamdutta/Zero2Prod_Axum_Diesel/tree/root-chapter03-part0/.github/workflows).
+You can find an updated version of the GitHub Actions setup [on GitHub](https://github.com/shubhenduanupamdutta/Zero2Prod_Axum_Diesel/tree/root-chapter03-part0/.github/workflows).
 
 Please keep in mind you need to add following secrets to your GitHub repository for the CI pipeline to work:
 
