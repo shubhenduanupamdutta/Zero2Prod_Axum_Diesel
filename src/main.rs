@@ -10,7 +10,7 @@ async fn main() -> Result<(), std::io::Error> {
     // Panic if we can't read configuration
     let configuration = get_configuration().expect("Failed to read configuration.");
     let db_config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
-        &configuration.database.connection_string(),
+        configuration.database.connection_string(),
     );
     let pool = Pool::builder(db_config)
         .build()
