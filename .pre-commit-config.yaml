@@ -1,0 +1,40 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+        exclude: '\.rs$'
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: mixed-line-ending
+
+  - repo: local
+    hooks:
+      - id: cargo-check
+        name: cargo check
+        entry: cargo check --all-targets
+        language: system
+        pass_filenames: false
+        types_or: [rust]
+
+      - id: cargo-fmt
+        name: cargo fmt nightly
+        entry: cargo +nightly fmt --all -- --check
+        language: system
+        pass_filenames: false
+        types_or: [rust]
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all -- -D warnings
+        language: system
+        pass_filenames: false
+        types_or: [rust]
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1
+    hooks:
+      - id: typos
