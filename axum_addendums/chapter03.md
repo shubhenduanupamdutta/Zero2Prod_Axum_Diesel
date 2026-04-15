@@ -50,7 +50,7 @@ async fn main() -> Result<(), std::io::Error> {
 }
 ```
 
-Let's pase it in our `main.rs` file.
+Let's paste it in our `main.rs` file.
 A quick `cargo check`:
 
 ```sh
