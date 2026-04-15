@@ -1,0 +1,134 @@
+name: rust-test-and-coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: "rust-tests-and-coverage"
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  DIESEL_VERSION: 2.3.7
+  DIESEL_FEATURES: postgres
+  APP_USER: ${{ secrets.APP_USER }}
+  APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+  APP_DB_NAME: newsletter
+  DATABASE_URL: postgres://${{ secrets.APP_USER }}:${{ secrets.APP_PASSWORD }}@localhost:5432/newsletter
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ${{ secrets.PG_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.PG_PASSWORD }}
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: install diesel cli
+        run: cargo install diesel_cli --version ${{ env.DIESEL_VERSION }} --features ${{ env.DIESEL_FEATURES }} --no-default-features --locked
+
+      - name: Create app user in database
+        run: |
+          sudo apt-get install postgresql-client
+
+          # create the app user
+          CREATE_QUERY="CREATE USER ${APP_USER} WITH PASSWORD '${APP_PASSWORD}';"
+          PGPASSWORD=${{ secrets.PG_PASSWORD }} psql -h localhost -U ${{ secrets.PG_USER }} -d postgres -c "${CREATE_QUERY}"
+
+          # Grant permissions to the app user
+          GRANT_QUERY="ALTER USER ${APP_USER} CREATEDB;"
+          PGPASSWORD=${{ secrets.PG_PASSWORD }} psql -h localhost -U ${{ secrets.PG_USER }} -d postgres -c "${GRANT_QUERY}"
+
+      - name: Migrate database
+        run: SKIP_DOCKER=true ./scripts/init_db.sh
+
+      - name: Fail if schema.rs changes
+        run: |
+          git diff --exit-code src/schema.rs || (echo "ERROR: src/schema.rs has changed after running migrations. Please run the migrations locally and commit the updated schema.rs." && exit 1)
+
+      - name: Run tests
+        run: cargo test --verbose
+
+  # `clippy` container job
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install the Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+      - name: Linting
+        run: cargo clippy -- -D warnings
+
+  # `coverage` container job
+  coverage:
+    name: Code coverage
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ${{ secrets.PG_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.PG_PASSWORD }}
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install the Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: llvm-tools-preview
+
+      - name: install diesel cli
+        run: cargo install diesel_cli --version ${{ env.DIESEL_VERSION }} --features ${{ env.DIESEL_FEATURES }} --no-default-features --locked
+
+      - name: Create app user in Postgres
+        run: |
+          sudo apt-get install postgresql-client
+
+          # Create the application user
+          CREATE_QUERY="CREATE USER ${APP_USER} WITH PASSWORD '${APP_PASSWORD}';"
+          PGPASSWORD=${{ secrets.PG_PASSWORD }} psql -U ${{ secrets.PG_USER }} -h "localhost" -c "${CREATE_QUERY}"
+
+          # Grant create db privileges to the app user
+          GRANT_QUERY="ALTER USER ${APP_USER} CREATEDB;"
+          PGPASSWORD=${{ secrets.PG_PASSWORD }} psql -U ${{ secrets.PG_USER }} -h "localhost" -c "${GRANT_QUERY}"
+      - name: Migrate database
+        run: SKIP_DOCKER=true ./scripts/init_db.sh
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate code coverage
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+
+      - name: Generate report
+        run: cargo llvm-cov report --html --output-dir coverage
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: "Coverage report"
+          path: coverage/
