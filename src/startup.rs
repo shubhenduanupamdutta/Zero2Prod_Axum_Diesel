@@ -6,7 +6,7 @@ use axum::{
     serve::Serve,
 };
 use diesel_async::AsyncPgConnection;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Mutex};
 
 use crate::routes::{health_check, subscribe};
 
@@ -16,13 +16,13 @@ pub fn run(
     connection: AsyncPgConnection,
 ) -> Result<Serve<TcpListener, Router, Router>, std::io::Error> {
     // Wrap the connection in an `Arc` to share it across multiple handlers
-    let connection = Arc::new(connection);
+    let connection = Arc::new(Mutex::new(connection));
 
     let app = Router::new()
         .route("/health_check", get(health_check))
         .route("/subscriptions", post(subscribe))
         // Add the connection to the application state so it can be accessed in handlers
-        .with_state(connection);
+        .with_state(connection.clone());
     let server = axum::serve(listener, app);
     Ok(server)
 }
