@@ -2374,3 +2374,419 @@ help: provide the argument
 
 For more information about this error, try `rustc --explain E0061`.
 ```
+
+---
+
+## 3.10 Updating Our Tests
+
+---
+
+The error is in our `spawn_app` helper function:
+
+```rust
+//! tests/health_check.rs
+use zero2prod::startup::run;
+use tokio::net::TcpListener;
+// [...]
+
+async fn spawn_app() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind to address");
+    // We retrieve the port assigned to us by the OS
+    let port = listener.local_addr().unwrap().port();
+    let server = run(listener).expect("Failed to start server");
+    let _server_handle = tokio::spawn(server.into_future());
+
+    // We return the application address to the caller!
+    format!("http://127.0.0.1:{}", port)
+}
+```
+
+We need to pass a connection pool to `run`. Given that we are then going to need that very same connection pool in `subscribe_returns_a_200_for_valid_form_data` to perform our `SELECT` query, it makes sense to generalise `spawn_app`: instead of returning a raw `String`, we will give the caller a struct, `TestApp`. `TestApp` will hold both the address of our test application instance and a handle to the connection pool, simplifying the arrange steps in our test cases.
+
+```rust
+//! tests/health_check.rs
+use diesel_async::{
+    AsyncConnection,
+    AsyncPgConnection,
+    RunQueryDsl,
+    pooled_connection::{AsyncDieselConnectionManager, deadpool::Pool},
+};
+use tokio::net::TcpListener;
+use zero2prod::{DbPool, configuration::get_configuration, schema::subscriptions, startup::run};
+
+pub struct TestApp {
+    pub address: String,
+    pub db_pool: DbPool,
+}
+async fn spawn_app() -> TestApp {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind to address");
+    let port = listener.local_addr().unwrap().port();
+    let address = format!("http://127.0.0.1:{}", port);
+
+    let configuration = get_configuration().expect("Failed to read configuration.");
+    let db_config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        configuration.database.connection_string(),
+    );
+    let pool = Pool::builder(db_config)
+        .build()
+        .expect("Failed to create connection pool.");
+
+    let server = run(listener, pool.clone()).expect("Failed to start server");
+    let _server_handle = tokio::spawn(server.into_future());
+
+    TestApp { address, db_pool: pool }
+}
+
+```
+
+All test cases have then to be updated accordingly — an off-screen exercise that I leave to you, my dear reader. Let's just have a look together at what `subscribe_returns_a_200_for_valid_form_data` looks like after the required changes:
+
+```rust
+//! tests/health_check.rs
+// [...]
+
+#[tokio::test]
+async fn subscribe_returns_a_200_for_valid_form_data() {
+    // Arrange
+    let app = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    // Act
+    let body = "name=le%20guin&email=ursula_le_guin%40gmail.com";
+    let response = client
+        .post(format!("{}/subscriptions", &app.address))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .expect("Failed to execute request.");
+
+    // Assert
+    assert_eq!(200, response.status().as_u16());
+
+    // Get saved subscriber for database
+    let mut conn = app
+        .db_pool
+        .get()
+        .await
+        .expect("Failed to get a connection from the pool.");
+
+    let (email, name) = subscriptions::table
+        .select((subscriptions::email, subscriptions::name))
+        .first::<(String, String)>(&mut conn)
+        .await
+        .expect("Failed to get saved subscription.");
+
+    assert_eq!(email, "ursula_le_guin@gmail.com");
+    assert_eq!(name, "le guin");
+}
+```
+
+The test intent is much clearer now that we got rid of most of the boilerplate related to establishing the connection with the database.
+
+`TestApp` is foundation we will be building on going forward to pull out supporting functionality that is useful to most of our integration tests.
+
+The moment of truth has finally come: is our updated `subscribe` implementation enough to turn `subscribe_returns_a_200_for_valid_form_data` green?
+
+```sh
+running 3 tests
+test health_check_works ... ok
+test subscribe_returns_a_400_when_data_is_missing ... ok
+test subscribe_returns_a_200_for_valid_form_data ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+```
+
+Yesssssssss!
+Success!
+
+Let's run it again to bathe in the light of this glorious moment!
+
+```sh
+cargo test
+
+running 3 tests
+test health_check_works ... ok
+test subscribe_returns_a_400_when_data_is_missing ... ok
+test subscribe_returns_a_200_for_valid_form_data ... FAILED
+
+failures:
+
+---- subscribe_returns_a_200_for_valid_form_data stdout ----
+Failed to execute query: DatabaseError(UniqueViolation, "duplicate key value violates unique constraint \"subscriptions_email_key\"")
+
+thread 'subscribe_returns_a_200_for_valid_form_data' (45443) panicked at tests/health_check.rs:84:5:
+assertion `left == right` failed
+  left: 200
+ right: 500
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    subscribe_returns_a_200_for_valid_form_data
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+```
+
+Wait, no, what the fuck! Don't do this to us!
+
+Ok, I lied — I knew this was going to happen.
+I am sorry, I let you taste the sweet flavour of victory and then I threw you back into the mud. There is an important lesson to be learned here, trust me.
+
+### 3.10.1 Test Isolation
+
+Your database is a gigantic global variable: all your tests are interacting with it and whatever they leave behind will be available to other tests in the suite as well as to the following test runs.
+
+This is precisely what happened to us a moment ago: our first test run commanded our application to register a new subscriber with `ursula_le_guin@gmail.com` as their email; the application obliged. When we re-ran our test suite we tried again to perform another `INSERT` using the same email, but our `UNIQUE` constraint on the email column raised a unique key violation and rejected the query, forcing the application to return us a `500 INTERNAL_SERVER_ERROR`.
+
+You really do not want to have any kind of interaction between your tests: it makes your test runs non-deterministic and it leads down the line to spurious test failures that are extremely tricky to hunt down and fix.
+
+There are two techniques I am aware of to ensure test isolation when interacting with a relational database in a test:
+
+- wrap the whole test in a SQL transaction and rollback at the end of it;
+- spin up a brand-new logical database for each integration test.
+
+The first is clever and will generally be faster: rolling back a SQL transaction takes less time than spinning up a new logical database. It works quite well when writing unit tests for your queries but it is tricky to pull off in an integration test like ours: our application will borrow a connection from the pool and we have no way to "capture" that connection in a SQL transaction context.
+
+Which leads us to the second option: potentially slower, yet much easier to implement.
+
+How? Before each test run, we want to:
+
+- create a new logical database with a unique name;
+- run database migrations on it.
+
+The best place to do this is `spawn_app`, before launching our axum test application. Let's look at it again:
+
+```rust
+//! tests/health_check.rs
+use diesel::prelude::*;
+use diesel_async::{
+    AsyncPgConnection,
+    RunQueryDsl,
+    pooled_connection::{AsyncDieselConnectionManager, deadpool::Pool},
+};
+use tokio::net::TcpListener;
+use zero2prod::{DbPool, configuration::get_configuration, schema::subscriptions, startup::run};
+
+pub struct TestApp {
+    pub address: String,
+    pub db_pool: DbPool,
+}
+
+async fn spawn_app() -> TestApp {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind to address");
+    let port = listener.local_addr().unwrap().port();
+    let address = format!("http://127.0.0.1:{}", port);
+
+    let configuration = get_configuration().expect("Failed to read configuration.");
+    let db_config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        configuration.database.connection_string(),
+    );
+    let pool = Pool::builder(db_config)
+        .build()
+        .expect("Failed to create connection pool.");
+
+    let server = run(listener, pool.clone()).expect("Failed to start server");
+    let _server_handle = tokio::spawn(server.into_future());
+
+    TestApp { address, db_pool: pool }
+}
+
+// [...]
+```
+
+`configuration.database.connection_string()` uses the `database_name` specified in our `configuration.yaml` file — the same for all tests. Let's randomise it with:
+
+```rust
+//! tests/health_check.rs
+let mut configuration = get_configuration().expect("Failed to read configuration.");
+configuration.database.database_name = Uuid::new_v4().to_string();
+let db_config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+    configuration.database.connection_string(),
+);
+```
+
+`cargo test` will fail: there is no database ready to accept connections using the name we generated. We need to create it!
+
+In order to issue a `CREATE DATABASE` command we need to connect to the Postgres instance, which implies connecting to a database that already exists. We'll use the `postgres` database for this purpose, the one that comes by default with a Postgres installation. It's often referred to as the "maintenance database" for this reason.
+
+For running migrations from files, we can use the `diesel_migrations` crate with `AsyncMigrationHarness` of `diesel_async`.
+Let's first add `diesel_migrations` to our `Cargo.toml`:
+
+```toml
+[dependencies]
+diesel_migrations = "2.3.1"
+```
+
+or
+
+```sh
+cargo add diesel_migrations
+```
+
+```rust
+//! tests/health_check.rs
+// [...]
+use diesel_async::{AsyncMigrationHarness};
+use diesel_migrations::{FileBasedMigrations, MigrationHarness};
+
+async fn spawn_app() -> TestApp {
+    // [...]
+    let mut configuration = get_configuration().expect("Failed to read configuration.");
+    configuration.database.database_name = Uuid::new_v4().to_string();
+    let pool = configure_database(&configuration.database).await;
+    // [...]
+}
+
+pub async fn configure_database(config: &DatabaseSettings) -> DbPool {
+    // Create Database
+    let maintenance_settings = DatabaseSettings {
+        database_name: "postgres".to_string(),
+        username: "postgres".to_string(),
+        password: "password".to_string(),
+        ..config.clone()
+    };
+
+    let mut connection = AsyncPgConnection::establish(&maintenance_settings.connection_string())
+        .await
+        .expect("Failed to connect to Postgres");
+
+    sql_query(format!(r#"CREATE DATABASE "{}";"#, config.database_name).as_str())
+        .execute(&mut connection)
+        .await
+        .expect("Failed to create database.");
+
+    // Migrate database
+    let connection_pool =
+        AsyncDieselConnectionManager::<AsyncPgConnection>::new(config.connection_string());
+    let pool = Pool::builder(connection_pool)
+        .build()
+        .expect("Failed to create connection pool.");
+    let migrations = FileBasedMigrations::find_migrations_directory()
+        .expect("Failed to find migrations directory.");
+    let mut harness = AsyncMigrationHarness::new(
+        pool.get()
+            .await
+            .expect("Failed to get a connection from the pool."),
+    );
+    harness
+        .run_pending_migrations(migrations)
+        .expect("Failed to run database migrations.");
+
+    pool
+}
+```
+
+Running `cargo test` again:
+
+```sh
+test subscribe_returns_a_200_for_valid_form_data ... FAILED
+test subscribe_returns_a_400_when_data_is_missing ... FAILED
+test health_check_works ... FAILED
+
+failures:
+
+---- subscribe_returns_a_200_for_valid_form_data stdout ----
+
+thread 'subscribe_returns_a_200_for_valid_form_data' (99676) panicked at /home/shubhendu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/diesel-async-0.8.0/src/migrations.rs:155:9:
+can call blocking only when running on the multi-threaded runtime
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- subscribe_returns_a_400_when_data_is_missing stdout ----
+
+thread 'subscribe_returns_a_400_when_data_is_missing' (99677) panicked at /home/shubhendu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/diesel-async-0.8.0/src/migrations.rs:155:9:
+can call blocking only when running on the multi-threaded runtime
+
+---- health_check_works stdout ----
+
+thread 'health_check_works' (99675) panicked at /home/shubhendu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/diesel-async-0.8.0/src/migrations.rs:155:9:
+can call blocking only when running on the multi-threaded runtime
+
+
+failures:
+    health_check_works
+    subscribe_returns_a_200_for_valid_form_data
+    subscribe_returns_a_400_when_data_is_missing
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+```
+
+We are getting this error because `AsyncMigrationHarness` calls `tokio::task::block_in_place` under the hood, which can only be called when running on the multi-threaded runtime. To fix this, we need to make sure that our tests are running on the multi-threaded runtime by adding the `#[tokio::test(flavor = "multi_thread")]` attribute to our test functions.
+
+This will make our whole test approach more complicated, since each test will require multi-threaded runtime. Let's go with a workaround. I can add `postgres` feature to `diesel` and use `diesel`'s synchronous API to run migrations on the same thread synchronously, which will allow us to keep using the single-threaded runtime for our tests.
+
+Now the `configure_database` function looks like this:
+
+```rust
+//! tests/health_check.rs
+pub async fn configure_database(config: &DatabaseSettings) -> DbPool {
+    // Create Database
+    let maintenance_settings = DatabaseSettings {
+        database_name: "postgres".to_string(),
+        username: "postgres".to_string(),
+        password: "password".to_string(),
+        ..config.clone()
+    };
+
+    let mut connection = AsyncPgConnection::establish(&maintenance_settings.connection_string())
+        .await
+        .expect("Failed to connect to Postgres");
+
+    sql_query(format!(r#"CREATE DATABASE "{}";"#, config.database_name).as_str())
+        .execute(&mut connection)
+        .await
+        .expect("Failed to create database.");
+
+
+    // Migrate database using synchronous connection.
+    // Here it is somewhat acceptable, since we do need to run migration before anything else
+    // happens with database. And by default tokio runs each tests in a single thread, so there
+    // is no other process anyway to be blocked on this thread while running migration.
+    {
+        let mut connection = PgConnection::establish(&config.connection_string())
+            .expect("Failed to connect to Postgres");
+        connection
+            .run_pending_migrations(
+                FileBasedMigrations::find_migrations_directory()
+                    .expect("Failed to find migration directory."),
+            )
+            .expect("Failed to run database migrations.");
+    }
+
+
+    // Create the connection pool and return it
+    let connection_pool =
+        AsyncDieselConnectionManager::<AsyncPgConnection>::new(config.connection_string());
+    Pool::builder(connection_pool)
+        .build()
+        .expect("Failed to create connection pool.")
+}
+```
+
+Let's try again to run `cargo test`:
+
+```sh
+     Running tests/health_check.rs (target/debug/deps/health_check-5e65cb996d78d8a1)
+
+running 3 tests
+test subscribe_returns_a_400_when_data_is_missing ... ok
+test health_check_works ... ok
+test subscribe_returns_a_200_for_valid_form_data ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+```
+
+It works, this time for good.
+
+You might have noticed that we do not perform any clean-up step at the end of our tests — the logical databases we create are not being deleted. This is intentional: we could add a clean-up step, but our Postgres instance is used only for test purposes and it's easy enough to restart it if, after hundreds of test runs, performance starts to suffer due to the number of lingering (almost empty) databases.
+
+## 3.11 Summary
+
+We covered a large number of topics in this chapter: `axum` extractors and HTML forms, (de)serialisation with `serde`, an overview of the available database crates in the Rust ecosystem, the fundamentals of `diesel` as well as basic techniques to ensure test isolation when dealing with databases.
+Take your time to digest the material and go back to review individual sections if necessary.
