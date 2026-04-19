@@ -4,6 +4,7 @@ use axum::{
     serve::Serve,
 };
 use tokio::net::TcpListener;
+use tower_http::trace::TraceLayer;
 
 use crate::{
     DbPool,
@@ -17,8 +18,8 @@ pub fn run(
     let app = Router::new()
         .route("/health_check", get(health_check))
         .route("/subscriptions", post(subscribe))
-        // Add the connection to the application state so it can be accessed in handlers
-        .with_state(pool);
+        .with_state(pool)
+        .layer(TraceLayer::new_for_http());
     let server = axum::serve(listener, app);
     Ok(server)
 }
