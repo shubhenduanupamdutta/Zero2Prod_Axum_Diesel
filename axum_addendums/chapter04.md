@@ -225,3 +225,302 @@ Logs are also an awesome tool to explore how the software we are using works.
 [2026-04-19T13:40:05Z TRACE tracing::span] -- request;
 [2026-04-19T13:40:05Z TRACE tracing::span] -- request;
 ```
+
+---
+
+## 4.4 Instrumenting POST /subscriptions
+
+---
+
+Let's use what we learned about `log` to instrument our handler for `POST /subscriptions` requests. It currently looks like this:
+
+```rust
+//! src/routes/subscriptions.rs
+// [...]
+
+pub async fn subscribe(State(pool): State<DbPool>, Form(form): Form<FormData>) -> StatusCode {
+    // [...]
+
+    match diesel::insert_into(subscriptions::table)
+        .values(&new_subscriber)
+        .execute(&mut conn)
+        .await
+    {
+        Ok(_) => StatusCode::OK,
+        Err(e) => {
+            // Using `eprintln!` to capture information about the error
+            // in case things don't work out as expected.
+            eprintln!("Failed to execute query: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        },
+    }
+}
+```
+
+Let's add `log` as a dependency:
+
+```toml
+#! Cargo.toml
+# [...]
+[dependencies]
+log = "0.4.29"
+```
+
+What should we capture in log records?
+
+### 4.4.1 Interactions With External Systems
+
+Let's start with a tried-and-tested rule of thumb: any interaction with external systems over the network should be closely monitored. We might experience networking issues, the database might be unavailable, queries might get slower over time as the `subscriptions` table gets longer, etc.
+
+Let's add two log records: one before query execution starts and one immediately after its completion.
+
+```rust
+//! src/routes/subscriptions.rs
+// [...]
+
+pub async fn subscribe(/* */) -> StatusCode {
+    // [...]
+
+    log::info!("Saving new subscriber details in the database");
+    match diesel::insert_into(subscriptions::table)
+        .values(&new_subscriber)
+        .execute(&mut conn)
+        .await
+    {
+        Ok(_) => {
+            log::info!("New subscriber details have been saved");
+            StatusCode::OK
+        },
+        Err(e) => {
+            eprintln!("Failed to execute query: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+```
+
+As it stands, we would only be emitting a log record when the query succeeds. To capture failures we need to convert that `eprintln!` statement into an error-level log:
+
+```rust
+//! src/routes/subscriptions.rs
+// [...]
+
+pub async fn subscribe(/* */) -> StatusCode {
+    log::info!("Saving new subscriber details in the database");
+    match diesel::insert_into(subscriptions::table)
+        .values(&new_subscriber)
+        .execute(&mut conn)
+        .await
+    {
+        Ok(_) => {
+            log::info!("New subscriber details have been saved");
+            StatusCode::OK
+        },
+        Err(e) => {
+            log::error!("Failed to execute query: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+```
+
+Much better — we have that query somewhat covered now.
+
+Pay attention to a small but crucial detail: we are using `{:?}`, the `std::fmt::Debug` format, to capture the query error.
+
+Operators are the main audience of logs — we should extract as much information as possible about whatever malfunction occurred to ease troubleshooting. `Debug` gives us that raw view, while `std::fmt::Display` (`{}`) will return a nicer error message that is more suitable to be shown directly to our end users.
+
+### 4.4.2 Think Like A User
+
+What else should we capture?
+
+Previously we stated that
+
+> We will happily settle for an application that is sufficiently observable to enable us to deliver the level of service we promised to our users.
+
+What does this mean _in practice_?
+
+We need to change our reference system.
+
+Forget, for a second, that we are the authors of this piece of software.
+
+Put yourself in the shoes of one of your users, a person landing on your website that is interested in the content you publish and wants to subscribe to your newsletter.
+
+What does a failure look like for them?
+
+The story might play out like this:
+
+> Hey!
+>
+> I tried subscribing to your newsletter using my main email address, thomas_mann@hotmail.com, but the website failed with a weird error. Any chance you could look into what happened?
+>
+> Best,
+> Tom
+>
+> P.S. Keep it up, your blog rocks!
+
+Tom landed on our website and received "a weird error" when he pressed the Submit button.
+
+Our application is _sufficiently observable_ if we can triage the issue from the breadcrumbs of information he has provided us — i.e. the email address he entered.
+
+Can we do it?
+
+Let's, first of all, confirm the issue: is Tom registered as a subscriber?
+
+We can connect to the database and run a quick query to double-check that there is no record with `thomas_mann@hotmail.com` as email in our `subscriptions` table.
+
+The issue is confirmed. What now?
+
+None of our logs include the subscriber email address, so we cannot search for it. Dead end.
+
+We could ask Tom to provide additional information: all our log records have a timestamp, maybe if he remembers around what time he tried to subscribe we can dig something out?
+
+This is a clear indication that our current logs are not good enough.
+
+Let's improve them:
+
+```rust
+//! src/routes/subscriptions.rs
+// [...]
+
+pub async fn subscribe(/* */) -> StatusCode {
+    // We are using the same interpolation syntax of `println`/`print` here!
+    log::info!(
+        "Adding '{}' '{}' as a new subscriber.",
+        form.email,
+        form.name
+    );
+    log::info!("Saving new subscriber details in the database");
+    match diesel::insert_into(subscriptions::table)
+        .values(&new_subscriber)
+        .execute(&mut conn)
+        .await
+    {
+        Ok(_) => {
+            log::info!("New subscriber details have been saved");
+            StatusCode::OK
+        },
+        Err(e) => {
+            log::error!("Failed to execute query: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+```
+
+Much better — we now have a log line that is capturing both name and email.
+
+Is it enough to troubleshoot Tom's issue?
+
+### 4.4.3 Logs Must Be Easy To Correlate
+
+If we had a single copy of our web server running at any point in time and that copy was only capable of handling a single request at a time, we might imagine logs showing up in our terminal more or less like this:
+
+```sh
+# First request
+[.. INFO zero2prod] Adding 'thomas_mann@hotmail.com' 'Tom' as a new subscriber
+[.. INFO zero2prod] Saving new subscriber details in the database
+[.. INFO zero2prod] New subscriber details have been saved
+[.. INFO zero2prod] .. "POST /subscriptions HTTP/1.1" 200 ..
+
+# Second request
+[.. INFO zero2prod] Adding 's_erikson@malazan.io' 'Steven' as a new subscriber
+[.. ERROR zero2prod] Failed to execute query: connection error with the database
+[.. ERROR zero2prod] .. "POST /subscriptions HTTP/1.1" 500 ..
+```
+
+You can clearly see where a single request begins, what happened while we tried to fulfill it, what we returned as a response, where the next request begins, etc.
+
+It is easy to follow.
+
+But this is not what it looks like when you are handling multiple requests concurrently:
+
+```sh
+[.. INFO zero2prod] Receiving request for POST /subscriptions
+[.. INFO zero2prod] Receiving request for POST /subscriptions
+[.. INFO zero2prod] Adding 'thomas_mann@hotmail.com' 'Tom' as a new subscriber
+[.. INFO zero2prod] Adding 's_erikson@malazan.io' 'Steven' as a new subscriber
+[.. INFO zero2prod] Saving new subscriber details in the database
+[.. ERROR zero2prod] Failed to execute query: connection error with the database
+[.. ERROR zero2prod] .. "POST /subscriptions HTTP/1.1" 500 ..
+[.. INFO zero2prod] Saving new subscriber details in the database
+[.. INFO zero2prod] New subscriber details have been saved
+[.. INFO zero2prod] .. "POST /subscriptions HTTP/1.1" 200 ..
+```
+
+What details did we fail to save though? `thomas_mann@hotmail.com` or `s_erikson@malazan.io`?
+
+Impossible to say from the logs.
+
+We need a way to correlate all logs related to the same request.
+
+This is usually achieved using a **request id** (also known as **correlation id**): when we start to process an incoming request we generate a random identifier (e.g. a UUID) which is then associated to all logs concerning the fulfilling of that specific request.
+
+Let's add one to our handler:
+
+```rust
+//! src/routes/subscriptions.rs
+// [...]
+
+pub async fn subscribe(/* */) -> StatusCode {
+    // Let's generate a random unique identifier
+    let request_id = Uuid::new_v4();
+    log::info!(
+        "request_id {} - Adding '{}' '{}' as a new subscriber.",
+        request_id,
+        form.email,
+        form.name
+    );
+    // [...]
+    log::info!(
+        "request_id {} - Saving new subscriber details in the database",
+        request_id
+    );
+    match diesel::insert_into(subscriptions::table)
+        .values(&new_subscriber)
+        .execute(&mut conn)
+        .await
+    {
+        Ok(_) => {
+            log::info!(
+                "request_id {} - New subscriber details have been saved",
+                request_id
+            );
+            StatusCode::OK
+        },
+        Err(e) => {
+            log::error!(
+                "request_id {} - Failed to execute query: {:?}",
+                request_id,
+                e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+```
+
+Logs for an incoming request will now look like this:
+
+```sh
+curl -i -X POST -d 'email=thomas_mann@hotmail.com&name=Tom' \
+    http://127.0.0.1:8000/subscriptions
+
+[2026-04-19T14:05:55Z INFO  zero2prod::routes::subscriptions] request_id 4200e77b-c0da-4a67-b493-5f934d4f624d - Adding 'thomas_mann@hotmail.com' 'Tom' as a new subscriber.
+[2026-04-19T14:05:55Z INFO  zero2prod::routes::subscriptions] request_id 4200e77b-c0da-4a67-b493-5f934d4f624d - Saving new subscriber details in the database
+[2026-04-19T14:05:55Z INFO  zero2prod::routes::subscriptions] request_id 4200e77b-c0da-4a67-b493-5f934d4f624d - New subscriber details have been saved successfully.
+```
+
+We can now search for `thomas_mann@hotmail.com` in our logs, find the first record, grab the `request_id` and then pull down all the other log records associated with that request.
+
+Well, almost all the logs: `request_id` is created in our `subscribe` handler, therefore `tower-http`'s `TraceLayer` middleware is completely unaware of it.
+
+That means that we will not know what status code our application has returned to the user when they tried to subscribe to our newsletter.
+
+What should we do?
+
+We could bite the bullet, remove `tower-http`'s `TraceLayer`, write a middleware to generate a random request identifier for every incoming request and then write our own logging middleware that is aware of the identifier and includes it in all log lines.
+
+Could it work? Yes.
+
+Should we do it? Probably not.
