@@ -25,6 +25,14 @@ struct InsertSubscription {
 
 
 pub async fn subscribe(State(pool): State<DbPool>, Form(form): Form<FormData>) -> StatusCode {
+    let request_id = Uuid::new_v4();
+    log::info!(
+        "request_id {} - Adding '{}' '{}' as a new subscriber.",
+        request_id,
+        form.email,
+        form.name
+    );
+
     let new_subscriber = InsertSubscription {
         id: Uuid::new_v4(),
         email: form.email,
@@ -37,14 +45,28 @@ pub async fn subscribe(State(pool): State<DbPool>, Form(form): Form<FormData>) -
         .await
         .expect("Failed to get a connection from the pool.");
 
+    log::info!(
+        "request_id {} - Saving new subscriber details in the database",
+        request_id
+    );
     match diesel::insert_into(subscriptions::table)
         .values(&new_subscriber)
         .execute(&mut conn)
         .await
     {
-        Ok(_) => StatusCode::OK,
+        Ok(_) => {
+            log::info!(
+                "request_id {} - New subscriber details have been saved successfully.",
+                request_id
+            );
+            StatusCode::OK
+        },
         Err(e) => {
-            eprintln!("Failed to execute query: {:?}", e);
+            log::error!(
+                "request_id {} - Failed to execute query: {:?}",
+                request_id,
+                e
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         },
     }
