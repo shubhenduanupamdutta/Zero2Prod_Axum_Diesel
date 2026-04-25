@@ -31,5 +31,5 @@ reqwest = "0.13.2"
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.51.0", features = ["macros", "rt-multi-thread"] }
 tower-http = { version = "0.6.8", features = ["trace"] }
-tracing = { version = "0.1.44", features = ["log-always"] }
+tracing = { version = "0.1.44", features = ["log", "log-always"] }
 uuid = { version = "1.23.0", features = ["v4"] }
