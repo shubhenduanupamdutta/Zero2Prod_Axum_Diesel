@@ -25,11 +25,12 @@ diesel-async = { version = "0.8.0", features = [
   "postgres"
 ] }
 diesel_migrations = "2.3.1"
-env_logger = "0.11.10"
-log = "0.4.29"
 reqwest = "0.13.2"
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.51.0", features = ["macros", "rt-multi-thread"] }
 tower-http = { version = "0.6.8", features = ["trace"] }
-tracing = { version = "0.1.44", features = ["log", "log-always"] }
+tracing = { version = "0.1.44", features = ["log"] }
+tracing-bunyan-formatter = "0.3.10"
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.23", features = ["registry", "env-filter"] }
 uuid = { version = "1.23.0", features = ["v4"] }
