@@ -8,8 +8,8 @@ use diesel_async::{
     pooled_connection::{AsyncDieselConnectionManager, deadpool::Pool},
 };
 use diesel_migrations::{FileBasedMigrations, MigrationHarness};
+use secrecy::ExposeSecret;
 use tokio::net::TcpListener;
-use tracing::Subscriber;
 use uuid::Uuid;
 use zero2prod::{
     DbPool,
@@ -71,13 +71,14 @@ pub async fn configure_database(config: &DatabaseSettings) -> DbPool {
     let maintenance_settings = DatabaseSettings {
         database_name: "postgres".to_string(),
         username: "postgres".to_string(),
-        password: "password".to_string(),
+        password: "password".into(),
         ..config.clone()
     };
 
-    let mut connection = AsyncPgConnection::establish(&maintenance_settings.connection_string())
-        .await
-        .expect("Failed to connect to Postgres");
+    let mut connection =
+        AsyncPgConnection::establish(maintenance_settings.connection_string().expose_secret())
+            .await
+            .expect("Failed to connect to Postgres");
 
     sql_query(format!(r#"CREATE DATABASE "{}";"#, config.database_name).as_str())
         .execute(&mut connection)
@@ -90,7 +91,7 @@ pub async fn configure_database(config: &DatabaseSettings) -> DbPool {
     // happens with database. And by default tokio runs each tests in a single thread, so there
     // is no other process anyway to be blocked on this thread while running migration.
     {
-        let mut connection = PgConnection::establish(&config.connection_string())
+        let mut connection = PgConnection::establish(config.connection_string().expose_secret())
             .expect("Failed to connect to Postgres");
         connection
             .run_pending_migrations(
@@ -102,8 +103,9 @@ pub async fn configure_database(config: &DatabaseSettings) -> DbPool {
 
 
     // Create the connection pool and return it
-    let connection_pool =
-        AsyncDieselConnectionManager::<AsyncPgConnection>::new(config.connection_string());
+    let connection_pool = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        config.connection_string().expose_secret(),
+    );
     Pool::builder(connection_pool)
         .build()
         .expect("Failed to create connection pool.")

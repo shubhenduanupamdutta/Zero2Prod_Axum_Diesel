@@ -42,7 +42,7 @@ pub async fn subscribe(State(pool): State<DbPool>, Form(form): Form<FormData>) -
 
     match insert_subscriber(&pool, &new_subscriber).await {
         Ok(_) => StatusCode::OK,
-        Err(e) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 

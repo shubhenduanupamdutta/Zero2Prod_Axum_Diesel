@@ -2,6 +2,7 @@ use diesel_async::{
     AsyncPgConnection,
     pooled_connection::{AsyncDieselConnectionManager, deadpool::Pool},
 };
+use secrecy::ExposeSecret;
 use tokio::net::TcpListener;
 use zero2prod::{
     configuration::get_configuration,
@@ -22,7 +23,7 @@ async fn main() -> Result<(), std::io::Error> {
     // Panic if we can't read configuration
     let configuration = get_configuration().expect("Failed to read configuration.");
     let db_config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
-        configuration.database.connection_string(),
+        configuration.database.connection_string().expose_secret(),
     );
     let pool = Pool::builder(db_config)
         .build()
