@@ -26,6 +26,7 @@ diesel-async = { version = "0.8.0", features = [
 ] }
 diesel_migrations = "2.3.1"
 reqwest = "0.13.2"
+secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.51.0", features = ["macros", "rt-multi-thread"] }
 tower-http = { version = "0.6.8", features = ["trace"] }
