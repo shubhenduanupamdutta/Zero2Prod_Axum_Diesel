@@ -2494,6 +2494,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3393,6 +3394,7 @@ dependencies = [
  "secrecy",
  "serde",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-bunyan-formatter",

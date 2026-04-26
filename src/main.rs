@@ -15,7 +15,10 @@ use zero2prod::{
 async fn main() -> Result<(), std::io::Error> {
     let subscriber = get_subscriber(
         "zero2prod".into(),
-        "info,tower_http=debug".into(),
+        format!(
+            "{}=info,tower_http=debug,axum::rejection=trace",
+            env!("CARGO_CRATE_NAME")
+        ),
         std::io::stdout,
     );
     init_subscriber(subscriber);
