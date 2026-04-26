@@ -12,7 +12,7 @@ use zero2prod::{
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
-    let subscriber = get_subscriber("zero2prod".into(), "info,http_tower=debug".into());
+    let subscriber = get_subscriber("zero2prod".into(), "info,tower_http=debug".into());
     init_subscriber(subscriber);
 
     // Panic if we can't read configuration
