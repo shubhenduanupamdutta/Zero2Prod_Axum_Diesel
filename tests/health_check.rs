@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use diesel::{prelude::*, sql_query};
 use diesel_async::{
     AsyncConnection,
@@ -13,7 +15,14 @@ use zero2prod::{
     configuration::{DatabaseSettings, get_configuration},
     schema::subscriptions,
     startup::run,
+    telemetry::{get_subscriber, init_subscriber},
 };
+
+// Ensures that the `tracing` stack is only initialized once using `LazyLock`
+static TRACING: LazyLock<()> = LazyLock::new(|| {
+    let subscriber = get_subscriber("test".into(), "debug,tower_http=trace".into());
+    init_subscriber(subscriber);
+});
 
 pub struct TestApp {
     pub address: String,
@@ -30,6 +39,8 @@ pub struct TestApp {
 /// A `TestApp` instance containing the address of the spawned application and the database
 /// connection pool.
 async fn spawn_app() -> TestApp {
+    LazyLock::force(&TRACING);
+
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind to address");
