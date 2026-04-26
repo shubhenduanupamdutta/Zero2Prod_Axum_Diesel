@@ -14,7 +14,6 @@ Your job for each pasted excerpt is to:
 2. Preserve the **section/sub-section heading structure** (e.g. `## 3.3`, `### 3.3.1`)
 3. Leave code blocks as placeholders marked `// user will fill in` **unless** the user has already provided the corrected axum/diesel code in their message — in that case, use it verbatim
 4. Append the converted section to the `temp.md` file under `axum_addendums/`
-5. If content is to remain unchanged (e.g. framework-agnostic explanations), mark it with a comment `// Everything as it is` to indicate no conversion is needed
 
 The **user edits the code themselves**. You only convert the surrounding text and structure.
 
@@ -59,7 +58,6 @@ When the book explains **why** a design decision was made (e.g. why a framework 
 
 ## Constraints
 
-- DO NOT reproduce framework-agnostic sections verbatim — mark them `// Intro as it is`
 - DO NOT invent or guess code the user hasn't provided
 - DO NOT modify any `src/` Rust files — addendum work only touches `axum_addendums/`
 - DO NOT add unsolicited explanations of axum internals beyond what the book section covers
