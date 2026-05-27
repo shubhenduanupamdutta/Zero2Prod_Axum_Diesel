@@ -19,7 +19,7 @@ axum = { version = "0.8.8", features = ["form"] }
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 config = "0.15.22"
 diesel = { version = "2.3.7", features = ["chrono", "postgres", "uuid"] }
-diesel-async = { version = "0.8.0", features = [
+diesel-async = { version = "0.9.0", features = [
   "deadpool",
   "migrations",
   "postgres"
